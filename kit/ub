@@ -250,7 +250,7 @@ class Change:
 def collect_change(base: str) -> Change:
     tracked = git("diff", "-z", "--name-only", "--diff-filter=ACMR", base).split("\0")
     untracked = git("ls-files", "-z", "--others", "--exclude-standard").split("\0")
-    noise = re.compile(r"^\.ub/(out|uml/\.metrics)/|^\.ub/uml/project\.edn$|(^|/)\.metrics/")
+    noise = re.compile(r"^\.ub/(out|state|uml/\.metrics)/|^\.ub/uml/project\.edn$|(^|/)\.metrics/")
     files = sorted({f for f in tracked + untracked if f and not noise.search(f)})
     return Change(base, files, {f for f in untracked if f})
 
@@ -791,6 +791,21 @@ class Gate:
         for path in sources + tested:
             self.mutate_one(lang, ad, path, path in tested, tests_changed)
 
+    def snapshot_at_base(self, lang: Lang, local: str) -> dict:
+        """What mutator knew at the base: the committed snapshot when the project commits
+        .metrics/mutate/ (a file without one there was never mutated: nothing to compare). When
+        it does not, the first snapshot this base met, kept in .ub/state/ — never the working
+        tree's as it is now, which a red rerun would already have rewritten."""
+        if git("ls-tree", "-r", "--name-only", self.base, "--", lang.repo_path(".metrics/mutate") + "/", check=False).strip():
+            return snapshot(lang, local, self.base)
+        state = UB / "state" / self.base[:12] / f"{lang.name}-{local.replace('/', '_')}.json"
+        if state.exists():
+            return json.loads(state.read_text())
+        current = snapshot(lang, local)
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps(current))
+        return current
+
     def mutate_one(self, lang: Lang, ad: Adapter, path: str, tested_only: bool, tests_changed: bool) -> None:
         local = lang.local(path)
         flags = []
@@ -803,7 +818,7 @@ class Gate:
             if not lines:
                 return
             flags += ["--lines", ",".join(str(n) for n in sorted(lines))]
-        before = (snapshot(lang, local, self.base) or snapshot(lang, local)) if tests_changed else {}
+        before = self.snapshot_at_base(lang, local) if tests_changed else {}
         log = self.log(f"mutate-{path}.log")
         print(f"   {path} {' '.join(f for f in flags if not f[0].isdigit())}".rstrip(), flush=True)
         rc, out = ad.mutate(local, flags, log)
@@ -873,6 +888,7 @@ class Gate:
 # ---------------------------------------------------------------- review by another model
 
 LOCKFILES = ["*.lock", "*pnpm-lock.yaml", "*package-lock.json", "*go.sum", "*.metrics/*", ".ub/out/*"]
+VERDICT_RE = re.compile(r"VERDICT:\s*\**\s*(PASS|CHANGES)\b")
 
 
 def review_prompt(base: str, card: str) -> str:
@@ -900,12 +916,14 @@ def run_reviewer(name: str, prompt: Path, answer: Path, err: Path, turns: str) -
     if not shutil.which(name):
         return "not installed"
     if name == "grok":
-        cmd, stdin = ["grok", "--prompt-file", str(prompt), "--cwd", str(ROOT), "--permission-mode", "plan",
-                      "--disable-web-search", "--max-turns", turns], None
+        # dontAsk: whatever needs approval (edits, most commands) is denied, never prompted —
+        # plan mode waited forever for an approval nobody could give in a headless run.
+        cmd, stdin = ["grok", "--prompt-file", str(prompt), "--cwd", str(ROOT), "--permission-mode", "dontAsk",
+                      "--disable-web-search", "--no-subagents", "--max-turns", turns], None
     elif name == "codex":
         cmd, stdin = ["codex", "exec", "--sandbox", "read-only", "-C", str(ROOT), "-"], prompt
     elif name == "claude":
-        cmd, stdin = ["claude", "-p", "--permission-mode", "plan"], prompt
+        cmd, stdin = ["claude", "-p", "--permission-mode", "dontAsk"], prompt
     else:
         return "unknown reviewer (grok, codex, claude)"
     limit = int(os.environ.get("REVIEW_TIMEOUT", "1800"))
@@ -923,8 +941,8 @@ def run_reviewer(name: str, prompt: Path, answer: Path, err: Path, turns: str) -
     if rc:
         tail = [l for l in err.read_text(errors="replace").splitlines() if l.strip()][-1:]
         return f"exit {rc}: {tail[0][:200] if tail else 'no message'}"
-    if not re.search(r"^\s*VERDICT:", answer.read_text(errors="replace"), re.M):
-        return "answered without a VERDICT line"
+    if not VERDICT_RE.search(answer.read_text(errors="replace")):
+        return "answered without a VERDICT"
     return ""
 
 
@@ -947,11 +965,13 @@ def cmd_review(args: list) -> int:
         print(f"review: asking {name}…", flush=True)
         why = run_reviewer(name, prompt, answer, err, cfg.review_turns)
         if not why:
-            print(f"review by {name}:\n")
             text = answer.read_text(errors="replace")
-            print(text)
-            verdict = re.search(r"^\s*VERDICT:\s*(\w+)", text, re.M)  # the first one counts
-            return 0 if verdict and verdict[1].upper() == "PASS" else 1
+            # The first verdict counts: a CHANGES review may quote PASS later. Grok streams its
+            # narration first, often glued to the verdict's line.
+            verdict = VERDICT_RE.search(text)
+            answer.write_text(text[verdict.start():])
+            print(f"review by {name} (.ub/out/review/answer.md):\n\n{text[verdict.start():]}")
+            return 0 if verdict[1] == "PASS" else 1
         print(f"review: {name} did not review it — {why}")
     print("review: no model answered — the task is NOT reviewed; tell the owner (.ub/out/review/error.log)")
     return 2

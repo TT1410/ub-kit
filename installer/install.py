@@ -420,7 +420,7 @@ def wire_gitignore(plan: Plan, langs: dict) -> None:
         return
     lines = ["# ub-kit: logs, the generated diagram, tool scratch. .metrics/mutate/ is committed:",
              "# it is mutator's memory of killed mutants, so the next run is differential.",
-             "/.ub/out/", "/.ub/uml/project.edn", "/.ub/uml/.metrics/", ".metrics/crap.edn", ".metrics/dry.edn",
+             "/.ub/out/", "/.ub/state/", "/.ub/uml/project.edn", "/.ub/uml/.metrics/", ".metrics/crap.edn", ".metrics/dry.edn",
              "target/mutation-workers/", "target/mutator-backup/", "target/coverage/"]
     lines += [f"/{info['rel']}/coverage/" if info["rel"] else "/coverage/" for lang, info in langs.items() if lang == "typescript"]
     plan.write(".gitignore", (text.rstrip("\n") + "\n\n" if text.strip() else "") + "\n".join(lines) + "\n", "ignore the kit's scratch")

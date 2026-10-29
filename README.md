@@ -47,7 +47,7 @@ cd ~/Projects/my-repo && claude                              # далі в Claud
 | `.ub/review.md` | проєкт | промпт рецензента |
 | `.ub/uml/policy.edn` | проєкт | політика uml-viewer: `:levels` — це Dependency Rule |
 | `.ub/baseline/` | проєкт | борг CRAP на день старту (режим ratchet) |
-| `.ub/out/` | — | логи воріт і рецензії (у `.gitignore`) |
+| `.ub/out/`, `.ub/state/` | — | логи воріт і рецензії; перший знімок mutator для бази, якщо `.metrics` не комітиться (у `.gitignore`) |
 | `.metrics/mutate/` | проєкт | пам'ять mutator про вбитих мутантів; комітиться, як у Мартіна |
 | `.claude/skills/ub-mode`, `ub-setup` | kit | дисципліна агента і разове налаштування |
 

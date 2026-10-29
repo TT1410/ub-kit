@@ -106,6 +106,15 @@ EOF
   expect 1 "a weakened test is red" -- just gate task
   has .ub/out/gate/summary.txt "killed before now survive" "the regression is named"
   expect 1 "and stays red on a rerun" -- just gate task
+
+  say "python: snapshots not committed — a rerun still cannot launder a weakened test"
+  git checkout -q task && git checkout -q -- . && git checkout -qb loose
+  git rm -rq --cached .metrics && printf '.metrics/\n' >>.gitignore && commit "snapshots not committed"
+  local b
+  b=$(git rev-parse HEAD)
+  sed -i.bak '/assert discount(500, loyal=True) == 0/d' tests/test_fees.py && rm -f tests/test_fees.py.bak
+  expect 1 "a weakened test is red" -- just gate "$b"
+  expect 1 "and stays red on a rerun" -- just gate "$b"
 }
 
 go_case() {
