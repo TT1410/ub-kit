@@ -888,7 +888,9 @@ class Gate:
 # ---------------------------------------------------------------- review by another model
 
 LOCKFILES = ["*.lock", "*pnpm-lock.yaml", "*package-lock.json", "*go.sum", "*.metrics/*", ".ub/out/*"]
-VERDICT_RE = re.compile(r"VERDICT:\s*\**\s*(PASS|CHANGES)\b")
+# The verdict opens the final message (review.md asks for it); a verdict quoted later, or in
+# narration before the final message, does not count.
+VERDICT_RE = re.compile(r"\s*[*_#>`]*\s*VERDICT:\s*[*_`]*\s*(PASS|CHANGES)\b")
 
 
 def review_prompt(base: str, card: str) -> str:
@@ -915,19 +917,24 @@ def run_reviewer(name: str, prompt: Path, answer: Path, err: Path, turns: str) -
     """Run one reviewer; returns "" when it answered with a verdict, else why not."""
     if not shutil.which(name):
         return "not installed"
+    raw = answer.with_name(f"{name}.raw")
     if name == "grok":
         # dontAsk: whatever needs approval (edits, most commands) is denied, never prompted —
-        # plan mode waited forever for an approval nobody could give in a headless run.
+        # plan mode waited forever for an approval nobody could give in a headless run. The
+        # stream's last "result" record is the final message alone, without the narration.
         cmd, stdin = ["grok", "--prompt-file", str(prompt), "--cwd", str(ROOT), "--permission-mode", "dontAsk",
-                      "--disable-web-search", "--no-subagents", "--max-turns", turns], None
+                      "--disable-web-search", "--no-subagents", "--max-turns", turns,
+                      "--output-format", "streaming-messages-json"], None
     elif name == "codex":
-        cmd, stdin = ["codex", "exec", "--sandbox", "read-only", "-C", str(ROOT), "-"], prompt
+        cmd, stdin = ["codex", "exec", "--sandbox", "read-only", "-C", str(ROOT),
+                      "--output-last-message", str(answer), "-"], prompt
     elif name == "claude":
-        cmd, stdin = ["claude", "-p", "--permission-mode", "dontAsk"], prompt
+        cmd, stdin = ["claude", "-p", "--permission-mode", "dontAsk", "--output-format", "json"], prompt
     else:
         return "unknown reviewer (grok, codex, claude)"
     limit = int(os.environ.get("REVIEW_TIMEOUT", "1800"))
-    with answer.open("w") as out, err.open("a") as e:
+    answer.write_text("")
+    with raw.open("w") as out, err.open("a") as e:
         e.write(f"\n--- {name} {time.strftime('%F %T')}\n")
         e.flush()
         fin = stdin.open() if stdin else subprocess.DEVNULL
@@ -941,9 +948,27 @@ def run_reviewer(name: str, prompt: Path, answer: Path, err: Path, turns: str) -
     if rc:
         tail = [l for l in err.read_text(errors="replace").splitlines() if l.strip()][-1:]
         return f"exit {rc}: {tail[0][:200] if tail else 'no message'}"
-    if not VERDICT_RE.search(answer.read_text(errors="replace")):
-        return "answered without a VERDICT"
+    if name != "codex":  # codex wrote its last message itself
+        answer.write_text(final_message(raw.read_text(errors="replace")))
+    if not VERDICT_RE.match(answer.read_text(errors="replace")):
+        return "the final message does not start with a VERDICT line"
     return ""
+
+
+def final_message(raw: str) -> str:
+    """The final message of a JSON (claude) or JSON-lines (grok) run: its "result"."""
+    for line in reversed(raw.strip().splitlines()):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and isinstance(record.get("result"), str):
+            return record["result"]
+    try:
+        record = json.loads(raw)
+        return record.get("result", "") if isinstance(record, dict) else ""
+    except ValueError:
+        return ""
 
 
 def cmd_review(args: list) -> int:
@@ -966,11 +991,8 @@ def cmd_review(args: list) -> int:
         why = run_reviewer(name, prompt, answer, err, cfg.review_turns)
         if not why:
             text = answer.read_text(errors="replace")
-            # The first verdict counts: a CHANGES review may quote PASS later. Grok streams its
-            # narration first, often glued to the verdict's line.
-            verdict = VERDICT_RE.search(text)
-            answer.write_text(text[verdict.start():])
-            print(f"review by {name} (.ub/out/review/answer.md):\n\n{text[verdict.start():]}")
+            verdict = VERDICT_RE.match(text)
+            print(f"review by {name} (.ub/out/review/answer.md):\n\n{text.strip()}\n")
             return 0 if verdict[1] == "PASS" else 1
         print(f"review: {name} did not review it — {why}")
     print("review: no model answered — the task is NOT reviewed; tell the owner (.ub/out/review/error.log)")
