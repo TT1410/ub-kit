@@ -1,0 +1,35 @@
+// ub-kit: paste into the project's vitest config (vitest.config.ts or vite.config.ts) and add
+//   plugins: [mutatorOverlay(here)]
+// where `here` is the config's directory:
+//   const here = fileURLToPath(new URL('./', import.meta.url))
+//
+// mutator runs each mutant in an overlay: a working directory of symlinks to the project and a
+// real copy of the mutated file. Vite follows the symlinks back to the unmutated file, so every
+// mutant would survive. With MUTATOR_OVERLAY=1 (set by the gate) an import that resolves into the
+// project is redirected to the overlay's file when that file is the real copy, not a link.
+// node_modules keep their links as they are. Without MUTATOR_OVERLAY the plugin does nothing.
+import { lstatSync } from 'node:fs'
+
+import type { Plugin } from 'vite'
+
+export function mutatorOverlay(here: string): Plugin {
+  const project = here.endsWith('/') ? here : `${here}/`
+  const overlay = `${process.cwd()}/`
+  return {
+    name: 'mutator-overlay',
+    enforce: 'pre',
+    async resolveId(source, importer, options) {
+      if (process.env.MUTATOR_OVERLAY !== '1') return null
+      const resolved = await this.resolve(source, importer, { ...options, skipSelf: true })
+      if (!resolved || !resolved.id.startsWith(project) || resolved.id.includes('/node_modules/')) {
+        return resolved
+      }
+      const copy = overlay + resolved.id.slice(project.length)
+      try {
+        return lstatSync(copy).isSymbolicLink() ? resolved : { ...resolved, id: copy }
+      } catch {
+        return resolved
+      }
+    },
+  }
+}

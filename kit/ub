@@ -1,0 +1,1221 @@
+#!/usr/bin/env python3
+"""ub — one disciplined agent per task, checked by Robert C. Martin's tools (ub-kit).
+
+Run from the repository; the justfile wraps every command:
+  gate [BASE]               the task's gate for what changed since BASE (default: the merge-base
+                            with the main branch): verify, CRAP, DRY, mutation, structure.
+                            Exit 0 green, 1 red, 2 cannot run.
+  review [BASE] [CARD]      another model reviews the diff, read-only. Exit 0 PASS, 1 CHANGES,
+                            2 no model answered (the task is not reviewed).
+  baseline                  ratchet mode: record today's CRAP debt; only new debt is red
+  doctor                    check the tools and the configuration, list what is left to do
+  uml [open|install|metrics|ir]                  uml-viewer: modules, dependencies, Dependency Rule
+  tools [install|crapper|mutator|dryer ARGS...]  Martin's tools at pinned commits
+
+Settings: .ub/config. Logs: .ub/out/. Needs git and Python >= 3.9; the tools need >= 3.11.
+GATE_SKIP=verify,crap,dry,mutation,structure skips gate stages (the reviewer sees it).
+"""
+from __future__ import annotations
+
+import configparser
+import contextlib
+import fcntl
+import glob as globlib
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+UB = Path(__file__).resolve().parent
+ROOT = UB.parent
+OUT = UB / "out"
+CONFIG = UB / "config"
+BASELINE = UB / "baseline" / "crap.tsv"
+POLICY = UB / "uml" / "policy.edn"
+DIAGRAM = UB / "uml" / "project.edn"
+# name -> commit. Bump deliberately, after reading the tool's log.
+PINS = {"crapper": "6fd92c4", "mutator": "a5a0cb8", "dryer": "66ff6d2"}
+UML_REPO = os.environ.get("UB_UML_REPO", "https://github.com/TT1410/uml-viewer.git")
+UML_REF = os.environ.get("UB_UML_REF", "2390b33")
+QUIL = "4.3.1563"
+_cache_home = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+CACHE = Path(os.environ.get("UB_CACHE") or _cache_home / "ub-kit")
+
+EXT = {
+    "python": (".py",),
+    "go": (".go",),
+    "typescript": (".ts", ".tsx", ".mts", ".cts"),
+}
+TEST_RE = {
+    "python": re.compile(r"(^|/)tests?/|(^|/)test_[^/]*\.py$|_test\.py$|(^|/)conftest\.py$"),
+    "go": re.compile(r"_test\.go$"),
+    "typescript": re.compile(r"\.(test|spec)\.[cm]?tsx?$|(^|/)(__tests__|__mocks__)/"),
+}
+NOT_PRODUCT = re.compile(
+    r"(^|/)(vendor|node_modules|\.venv|venv|dist|build|target|testdata|e2e|\.metrics|\.ub)/"
+    r"|\.d\.[cm]?ts$"
+)
+SITE_RE = re.compile(r"^(SURVIVED|UNCOVERED)\s+(.+?):(\d+)\s+(.*)$", re.M)
+TOTAL_RE = re.compile(r"^Total\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)", re.M)
+
+
+class UbError(Exception):
+    """A problem that stops the command: wrong setup, not a red gate."""
+
+
+class StageFail(Exception):
+    """A tool could not produce its report; the stage is red."""
+
+
+# ---------------------------------------------------------------- configuration
+
+
+def _norm(path: str) -> str:
+    path = (path or "").strip().strip("/")
+    while path.startswith("./"):
+        path = path[2:]
+    return "" if path in (".", "") else path
+
+
+@dataclass
+class Lang:
+    name: str
+    rel: str  # the language root (go.mod, pyproject.toml, package.json), from the repo root
+    src: str  # product sources, from the language root; "" means all of it
+    opts: dict
+
+    @property
+    def root(self) -> Path:
+        return ROOT / self.rel if self.rel else ROOT
+
+    def repo_path(self, local: str) -> str:
+        local = _norm(local)
+        return f"{self.rel}/{local}" if self.rel else local
+
+    def local(self, repo_path: str) -> str:
+        return repo_path[len(self.rel) + 1:] if self.rel else repo_path
+
+    def owns(self, repo_path: str) -> bool:
+        return not self.rel or repo_path.startswith(self.rel + "/")
+
+    def in_src(self, repo_path: str) -> bool:
+        return self.owns(repo_path) and (not self.src or self.local(repo_path).startswith(self.src + "/"))
+
+    def src_args(self) -> list:
+        return ["-s", self.src] if self.src else []
+
+
+@dataclass
+class Config:
+    main: str
+    mode: str
+    verify: str
+    crap_max: float
+    dry_threshold: str
+    exclude: Optional[re.Pattern]
+    structure: str
+    workers: str
+    reviewers: list
+    review_turns: str
+    langs: list
+
+
+def load_config() -> Config:
+    if not CONFIG.exists():
+        raise UbError(f"no {CONFIG.relative_to(ROOT)} — install ub-kit into this repository first")
+    cp = configparser.ConfigParser(inline_comment_prefixes=(";", "#"), interpolation=None)
+    cp.read(CONFIG, encoding="utf-8")
+    ub = cp["ub"] if cp.has_section("ub") else {}
+    langs = []
+    for name in EXT:
+        if cp.has_section(name):
+            sec = cp[name]
+            langs.append(Lang(name, _norm(sec.get("root", ".")), _norm(sec.get("src", "")), dict(sec)))
+    mode = ub.get("mode", "strict").strip()
+    if mode not in ("strict", "ratchet"):
+        raise UbError(f"mode = {mode}: use strict or ratchet")
+    exclude = ub.get("exclude", "").strip()
+    return Config(
+        main=ub.get("main", "main").strip(),
+        mode=mode,
+        verify=ub.get("verify", "").strip(),
+        crap_max=float(ub.get("crap_max", "10")),
+        dry_threshold=ub.get("dry_threshold", "0.8").strip(),
+        exclude=re.compile(exclude) if exclude else None,
+        structure=ub.get("structure", "auto").strip(),
+        workers=ub.get("workers", "4").strip(),
+        reviewers=(os.environ.get("REVIEWER", "") + " " + ub.get("reviewers", "grok codex")).split(),
+        review_turns=ub.get("review_turns", "30").strip(),
+        langs=langs,
+    )
+
+
+# ---------------------------------------------------------------- git and processes
+
+
+def git(*args: str, cwd: Path = ROOT, check: bool = True) -> str:
+    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, errors="replace")
+    if check and r.returncode:
+        raise UbError(f"git {' '.join(args)}: {r.stderr.strip()}")
+    return r.stdout
+
+
+def ref_exists(ref: str) -> bool:
+    if not ref:
+        return False
+    r = subprocess.run(["git", "rev-parse", "-q", "--verify", f"{ref}^{{commit}}"], cwd=ROOT,
+                       capture_output=True)
+    return r.returncode == 0
+
+
+def default_base(cfg: Config) -> str:
+    for ref in (cfg.main, f"origin/{cfg.main}"):
+        if ref_exists(ref):
+            r = subprocess.run(["git", "merge-base", "HEAD", ref], cwd=ROOT, capture_output=True, text=True)
+            if r.returncode == 0:
+                return r.stdout.strip()
+    return ""
+
+
+def run(cmd, cwd: Path, log: Path, env: Optional[dict] = None, shell: bool = False):
+    """Run a command, keep its whole output in the log, return (exit code, output)."""
+    log.parent.mkdir(parents=True, exist_ok=True)
+    shown = cmd if isinstance(cmd, str) else shlex.join(str(c) for c in cmd)
+    started = time.time()
+    r = subprocess.run(cmd, cwd=cwd, env=dict(os.environ, **(env or {})), shell=shell,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+    log.write_text(f"$ {shown}\n(cwd {cwd}, exit {r.returncode}, {time.time() - started:.0f}s)\n\n{r.stdout}",
+                   encoding="utf-8")
+    return r.returncode, r.stdout
+
+
+def rel(path: Path) -> str:
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def generated(path: Path) -> bool:
+    """A file whose first lines say it is generated and not to be edited (Go's convention and
+    most generators'): the gate does not judge it."""
+    try:
+        with path.open(encoding="utf-8", errors="ignore") as fh:
+            head = "".join(fh.readline() for _ in range(5)).lower()
+    except OSError:
+        return False
+    return "generated" in head and "do not edit" in head
+
+
+# ---------------------------------------------------------------- what changed
+
+
+@dataclass
+class Change:
+    base: str
+    files: list  # changed since base and untracked, repo paths
+    untracked: set
+    _lines: dict = field(default_factory=dict)
+
+    def lines(self, path: str) -> Optional[set]:
+        """Lines of the file that differ from base; None when the whole file is new."""
+        if path in self.untracked:
+            return None
+        if path not in self._lines:
+            out = git("diff", "-U0", "--no-color", "--no-ext-diff", self.base, "--", path)
+            if re.search(r"^new file mode", out, re.M):
+                self._lines[path] = None
+            else:
+                lines = set()
+                for m in re.finditer(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", out, re.M):
+                    start, count = int(m[1]), int(m[2]) if m[2] is not None else 1
+                    # A pure deletion sits between `start` and the next line.
+                    lines.update({max(start, 1), start + 1} if count == 0 else range(start, start + count))
+                self._lines[path] = lines
+        return self._lines[path]
+
+    def touches(self, path: str, first: int, last: int) -> bool:
+        lines = self.lines(path)
+        return lines is None or any(first <= n <= last for n in lines)
+
+
+def collect_change(base: str) -> Change:
+    tracked = git("diff", "-z", "--name-only", "--diff-filter=ACMR", base).split("\0")
+    untracked = git("ls-files", "-z", "--others", "--exclude-standard").split("\0")
+    noise = re.compile(r"^\.ub/(out|uml/\.metrics)/|^\.ub/uml/project\.edn$|(^|/)\.metrics/")
+    files = sorted({f for f in tracked + untracked if f and not noise.search(f)})
+    return Change(base, files, {f for f in untracked if f})
+
+
+# ---------------------------------------------------------------- Martin's tools
+
+
+@contextlib.contextmanager
+def locked(name: str):
+    CACHE.mkdir(parents=True, exist_ok=True)
+    with open(CACHE / f"{name}.lock", "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
+
+
+def python311() -> Optional[str]:
+    for exe in ("python3.13", "python3.12", "python3.11", "python3"):
+        path = shutil.which(exe)
+        if path and subprocess.run([path, "-c", "import sys; sys.exit(sys.version_info < (3, 11))"]).returncode == 0:
+            return path
+    return None
+
+
+def tools_dir() -> Path:
+    key = hashlib.sha1(json.dumps(PINS, sort_keys=True).encode()).hexdigest()[:8]
+    return CACHE / f"tools-{key}"
+
+
+def tools_ready() -> bool:
+    d = tools_dir()
+    return all((d / n / n).exists() and (d / n / ".venv" / "bin" / "python").exists() for n in PINS)
+
+
+def tools_install(quiet: bool = False) -> None:
+    """Clone crapper, mutator and dryer at the pinned commits into the shared cache (mutator
+    finds crapper beside it) and build each one's virtualenv with a Python >= 3.11."""
+    d = tools_dir()
+    with locked("tools"):
+        d.mkdir(parents=True, exist_ok=True)
+        py = None
+        for name, sha in PINS.items():
+            repo = d / name
+            if not (repo / ".git").is_dir():
+                subprocess.run(["git", "clone", "-q", f"https://github.com/unclebob/{name}.git", str(repo)], check=True)
+            if git("rev-parse", "--short=7", "HEAD", cwd=repo).strip() != sha:
+                subprocess.run(["git", "-C", str(repo), "fetch", "-q", "origin"], check=True)
+                subprocess.run(["git", "-C", str(repo), "checkout", "-q", sha], check=True)
+            if not (repo / ".venv" / "bin" / "python").exists():
+                py = py or python311()
+                if not py:
+                    raise UbError("Martin's tools need Python >= 3.11 on PATH (brew install python@3.12, or uv python install 3.12)")
+                subprocess.run([py, "-m", "venv", str(repo / ".venv")], check=True)
+                subprocess.run([str(repo / ".venv" / "bin" / "pip"), "install", "-q", "--disable-pip-version-check",
+                                "-e", str(repo)], check=True)
+            if not quiet:
+                print(name, git("log", "-1", "--format=%h %ci %s", cwd=repo).strip())
+    if not quiet:
+        print(f"in {d}")
+
+
+def tool(name: str) -> str:
+    if not tools_ready():
+        tools_install(quiet=True)
+    return str(tools_dir() / name / name)
+
+
+def crap_rows(text: str) -> list:
+    """crapper's table: Function Namespace CC Cov% CRAP -> [(name, namespace, crap)]."""
+    rows, on = [], False
+    for line in text.splitlines():
+        if re.match(r"\s*Function\s+Namespace\s+CC", line):
+            on = True
+        elif line.startswith("Wrote "):
+            on = False
+        elif on and len(line.split()) >= 5 and not line.lstrip().startswith("-"):
+            parts = line.split()
+            rows.append((parts[0], parts[1], parts[-1]))
+    return rows
+
+
+def crap_value(crap: str) -> float:
+    try:
+        return float(crap)
+    except ValueError:
+        return float("inf")  # N/A: no coverage is the worst score
+
+
+def dry_groups(text: str) -> list:
+    """dryer's report: 'DUPLICATE score=…' then one 'path:first-last' per member."""
+    groups = []
+    for line in text.splitlines():
+        m = re.match(r"DUPLICATE score=([\d.]+)", line)
+        if m:
+            groups.append((m[1], []))
+            continue
+        m = re.match(r"\s+(\S.*):(\d+)-(\d+)\s*$", line)
+        if m and groups:
+            groups[-1][1].append((m[1], int(m[2]), int(m[3])))
+    return groups
+
+
+def snapshot(lang: Lang, local: str, ref: str = "") -> dict:
+    """mutator's outcomes for one source file, site key -> killed|survived|…: the working tree's,
+    or the ones committed at `ref` (.metrics/mutate/ is committed, so a rerun of the gate cannot
+    launder a regression into the snapshot it is compared with)."""
+    outcomes = {}
+    if ref:
+        d = lang.repo_path(".metrics/mutate")
+        names = git("ls-tree", "-r", "-z", "--name-only", ref, "--", d + "/", check=False).split("\0")
+        texts = [git("show", f"{ref}:{n}", check=False) for n in names if n.endswith(".edn")]
+    else:
+        # Go namespaces are import paths, so its snapshots nest: .metrics/mutate/acme/internal/x.edn
+        texts = [f.read_text(encoding="utf-8", errors="ignore") for f in (lang.root / ".metrics" / "mutate").rglob("*.edn")]
+    for text in texts:
+        m = re.search(r':source\s+"([^"]+)"', text)
+        if not m or _norm(m[1]) != local:
+            continue
+        part = re.search(r":outcomes\s*\{(.*?)\}\s*:forms", text, re.S)
+        if part:
+            outcomes.update(re.findall(r'"((?:[^"\\]|\\.)*)"\s+:([\w-]+)', part[1]))
+    return outcomes
+
+
+def describe_site(key: str) -> str:
+    try:
+        parts = json.loads(key.replace('\\"', '"').replace("\\\\", "\\"))
+        return f"{parts[2]} {parts[5]} -> {parts[6]}"
+    except (ValueError, IndexError):
+        return key
+
+
+# ---------------------------------------------------------------- languages
+
+
+def ts_vitest(root: Path) -> list:
+    """vitest's own binary, not `pnpm exec` and the like: a package manager may decide to verify
+    or reinstall dependencies first, and inside mutator's overlay (whose node_modules is a link
+    to the real one) that fails every mutant — false kills — or touches the real install."""
+    d = root
+    while True:
+        b = d / "node_modules" / ".bin" / "vitest"
+        if b.exists():
+            # Relative inside the language root, so it resolves in each overlay worker too.
+            return ["node_modules/.bin/vitest"] if d == root else [str(b)]
+        if d == ROOT or d.parent == d:
+            return ts_pm(root) + ["vitest"]
+        d = d.parent
+
+
+def ts_pm(root: Path) -> list:
+    """How to run a package binary in this TS project: pnpm exec, yarn, bunx or npx."""
+    d = root
+    while True:
+        for lock, cmd in (("pnpm-lock.yaml", ["pnpm", "exec"]), ("yarn.lock", ["yarn"]),
+                          ("bun.lock", ["bunx"]), ("bun.lockb", ["bunx"]), ("package-lock.json", ["npx", "--no-install"])):
+            if (d / lock).exists():
+                return cmd
+        if d == ROOT or d.parent == d:
+            return ["npx", "--no-install"]
+        d = d.parent
+
+
+def ts_specs(root: Path, files: list) -> list:
+    """A TS module's own specs, beside it: name.spec.ts, name.test.ts, name.*.spec.ts, and the
+    same in __tests__/. A related-tests search would reach most of a suite through barrels."""
+    found = set()
+    for f in files:
+        p = Path(f)
+        stem, name = globlib.escape(str(p.with_suffix(""))), globlib.escape(p.stem)
+        d = "" if str(p.parent) == "." else globlib.escape(str(p.parent)) + "/"
+        for pattern in (f"{stem}.*spec.ts", f"{stem}.*test.ts", f"{stem}.*spec.tsx", f"{stem}.*test.tsx",
+                        f"{d}__tests__/{name}.*ts", f"{d}__tests__/{name}.*tsx"):
+            found.update(str(s.relative_to(root)) for s in root.glob(pattern) if TEST_RE["typescript"].search(str(s)))
+    return sorted(found)
+
+
+class Adapter:
+    """How crapper, dryer and mutator run for one language of the project."""
+
+    def __init__(self, lang: Lang, cfg: Config):
+        self.lang, self.cfg = lang, cfg
+        self._src_files = None
+
+    @property
+    def root(self) -> Path:
+        return self.lang.root
+
+    def workers(self) -> list:
+        return ["--max-workers", self.cfg.workers] if self.cfg.workers else []
+
+    def src_files(self) -> list:
+        """Product files of this language under its source root, language-root paths."""
+        if self._src_files is None:
+            listed = git("ls-files", "-z", "--", self.lang.src or ".", cwd=self.root).split("\0")
+            self._src_files = [f for f in listed if f.endswith(EXT[self.lang.name])
+                               and not TEST_RE[self.lang.name].search(f) and not NOT_PRODUCT.search(f)]
+        return self._src_files
+
+    def crap(self, files: list, log: Path):
+        raise NotImplementedError
+
+    def crap_all(self, log: Path):
+        raise NotImplementedError
+
+    def mutate(self, file: str, flags: list, log: Path):
+        raise NotImplementedError
+
+    def tested_by(self, test: str) -> list:
+        """Product files a changed test file tests, language-root paths."""
+        return []
+
+    def problems(self) -> list:
+        """(ok, text) lines for ub doctor."""
+        return []
+
+
+class PythonAdapter(Adapter):
+    """crapper and mutator find the project's interpreter (.venv) and run pytest with coverage
+    themselves; config keys `test` and `coverage` override the commands."""
+
+    def _cov(self) -> list:
+        c = self.lang.opts.get("coverage", "").strip()
+        return ["--coverage-command", c] if c else []
+
+    def crap(self, files, log):
+        return run([tool("crapper"), "--root", ".", *self._cov(), *files], self.root, log)
+
+    def crap_all(self, log):
+        return run([tool("crapper"), "--root", ".", *self._cov(), *self.lang.src_args()], self.root, log)
+
+    def mutate(self, file, flags, log):
+        test = self.lang.opts.get("test", "").strip()
+        return run([tool("mutator"), "--root", ".", *self.workers(), *self._cov(),
+                    *(["--test-command", test] if test else []), *flags, file], self.root, log)
+
+    def tested_by(self, test):
+        name = Path(test).name
+        m = re.match(r"test_(.+\.py)$", name) or re.match(r"(.+)_test\.py$", name)
+        if not m:
+            return []
+        target = m[1] if m[1].endswith(".py") else m[1] + ".py"
+        return [f for f in self.src_files() if Path(f).name == target]
+
+    def problems(self):
+        out = []
+        venv = self.root / ".venv" / "bin" / "python"
+        if not venv.exists():
+            out.append((None, f"{self.lang.rel or '.'}: no .venv — crapper and mutator use python3 from PATH; it must import pytest and coverage"))
+            return out
+        r = subprocess.run([str(venv), "-c", "import pytest, coverage"], capture_output=True)
+        out.append((r.returncode == 0, ".venv has pytest and coverage" if r.returncode == 0
+                    else ".venv lacks pytest or coverage (add them to the dev dependencies)"))
+        # An editable install points the tests at the original tree, not at mutator's overlay copy.
+        src = str((self.root / (self.lang.src or ".")).resolve())
+        hits = []
+        for pth in (self.root / ".venv").glob("lib/python*/site-packages/*.pth"):
+            text = pth.read_text(errors="ignore")
+            if src in text or "__editable__" in pth.name:
+                hits.append(pth.name)
+        out.append((not hits, "the project is not installed into .venv" if not hits else
+                    f"editable install in .venv ({', '.join(hits)}): mutants would run against the original "
+                    "files — use uv `package = false` (or no `pip install -e`) and pytest `pythonpath`"))
+        return out
+
+
+class GoAdapter(Adapter):
+    """Coverage of the changed packages (or of the package tree named by config key `tree`, a
+    regex whose group 1 is the directory whose tests judge a file), profile paths rewritten so
+    mutator matches them to files."""
+
+    def package(self, file: str) -> str:
+        rx = self.lang.opts.get("tree", "").strip()
+        m = re.match(rx, file) if rx else None
+        if m:
+            return f"./{m[1]}/..."
+        d = str(Path(file).parent)
+        return "." if d == "." else f"./{d}"
+
+    def _cover(self, pkgs: list, log: Path):
+        rc, out = run([sys.executable, str(UB / "ub"), "go-cover", str(self.root), *pkgs], self.root, log)
+        if rc:
+            raise StageFail(f"Go tests failed ({rel(log)})")
+
+    def crap(self, files, log):
+        self._cover(sorted({self.package(f) for f in files}), log.with_name(log.stem + "-cover.log"))
+        return run([tool("crapper"), "--root", ".", "--use-existing-coverage", *files], self.root, log)
+
+    def crap_all(self, log):
+        self._cover(["./..."], log.with_name(log.stem + "-cover.log"))
+        return run([tool("crapper"), "--root", ".", "--use-existing-coverage", *self.lang.src_args()], self.root, log)
+
+    def mutate(self, file, flags, log):
+        pkg = self.package(file)
+        cover = shlex.join([sys.executable, str(UB / "ub"), "go-cover", str(self.root), pkg])
+        test = self.lang.opts.get("test", "").strip() or f"go test -count=1 {pkg}"
+        return run([tool("mutator"), "--root", ".", *self.workers(), "--coverage-command", cover,
+                    "--test-command", test, *flags, file], self.root, log)
+
+    def tested_by(self, test):
+        target = re.sub(r"_test\.go$", ".go", test)
+        return [target] if target in self.src_files() else []
+
+    def problems(self):
+        ok = bool(shutil.which("go"))
+        mod = (self.root / "go.mod").exists()
+        return [(ok, "go on PATH" if ok else "go is missing"),
+                (mod, f"{self.lang.rel or '.'}/go.mod" if mod else f"no go.mod in {self.lang.rel or '.'}")]
+
+
+class TsAdapter(Adapter):
+    """vitest with v8 coverage; each module is judged by its own specs. Mutants need the overlay
+    plugin in the vitest config (.ub/snippets/vitest-mutator-overlay.ts.txt): Vite follows
+    mutator's symlinks back to the unmutated file otherwise."""
+
+    def overlay_ready(self) -> bool:
+        for name in ("vitest.config", "vite.config", "vitest.workspace"):
+            for ext in (".ts", ".mts", ".js", ".mjs", ".cts"):
+                f = self.root / (name + ext)
+                if f.exists() and "MUTATOR_OVERLAY" in f.read_text(errors="ignore"):
+                    return True
+        return False
+
+    def _cover(self, files: list, log: Path):
+        rc, out = run([sys.executable, str(UB / "ub"), "ts-cover", str(self.root), *files], self.root, log)
+        if rc:
+            raise StageFail(f"specs failed ({rel(log)})")
+
+    def crap(self, files, log):
+        self._cover(files, log.with_name(log.stem + "-cover.log"))
+        return run([tool("crapper"), "--root", ".", "--use-existing-coverage", *files], self.root, log)
+
+    def crap_all(self, log):
+        self._cover([], log.with_name(log.stem + "-cover.log"))
+        return run([tool("crapper"), "--root", ".", "--use-existing-coverage", *self.lang.src_args()], self.root, log)
+
+    def mutate(self, file, flags, log):
+        specs = ts_specs(self.root, [file])
+        cover = shlex.join([sys.executable, str(UB / "ub"), "ts-cover", str(self.root), file])
+        test = "MUTATOR_OVERLAY=1 " + shlex.join(ts_vitest(self.root) + ["run", "--bail=1",
+                                                                            *(specs or ["--passWithNoTests"])])
+        return run([tool("mutator"), "--root", ".", *self.workers(), "--coverage-command", cover,
+                    "--test-command", test, *flags, file], self.root, log)
+
+    def tested_by(self, test):
+        p = Path(test)
+        name = re.sub(r"(\.[^.]+)?\.(test|spec)\.([cm]?tsx?)$", r".\3", p.name)
+        d = p.parent.parent if p.parent.name == "__tests__" else p.parent
+        target = str(d / name) if str(d) != "." else name
+        alt = re.sub(r"\.ts$", ".tsx", target) if target.endswith(".ts") else re.sub(r"\.tsx$", ".ts", target)
+        return [f for f in (target, alt) if f in self.src_files()]
+
+    def problems(self):
+        out = [(bool(shutil.which("node")), "node on PATH" if shutil.which("node") else "node is missing")]
+        nm = next((d / "node_modules" for d in (self.root, ROOT) if (d / "node_modules" / "vitest").exists()),
+                  self.root / "node_modules")
+        has_vitest = (nm / "vitest").exists()
+        out.append((has_vitest, "vitest installed" if has_vitest else f"no vitest in {rel(nm)} (install the project's deps; only vitest is supported)"))
+        cov = (nm / "@vitest" / "coverage-v8").exists() or (nm / "@vitest" / "coverage-istanbul").exists()
+        out.append((cov, "vitest coverage provider installed" if cov else "add @vitest/coverage-v8 to devDependencies"))
+        ready = self.overlay_ready()
+        out.append((ready, "mutator overlay plugin in the vitest config" if ready else
+                    "the vitest config lacks the mutator overlay plugin (.ub/snippets/vitest-mutator-overlay.ts.txt)"))
+        return out
+
+
+ADAPTERS = {"python": PythonAdapter, "go": GoAdapter, "typescript": TsAdapter}
+
+
+# ---------------------------------------------------------------- the gate
+
+
+def load_baseline() -> dict:
+    base = {}
+    if BASELINE.exists():
+        for line in BASELINE.read_text(encoding="utf-8").splitlines():
+            parts = line.split("\t")
+            if len(parts) == 4 and not line.startswith("#"):
+                base[(parts[0], parts[1], parts[2])] = parts[3]
+    return base
+
+
+class Gate:
+    """One command, one exit code, which the agent loops on until it is green. Every stage fails
+    closed: a tool that crashes or prints no report is red."""
+
+    def __init__(self, cfg: Config, base: str):
+        self.cfg, self.base = cfg, base
+        self.skip = {s.strip() for s in os.environ.get("GATE_SKIP", "").split(",") if s.strip()}
+        self.failures, self.debts = [], []
+        self.dir = OUT / "gate"
+        shutil.rmtree(self.dir, ignore_errors=True)
+        self.dir.mkdir(parents=True)
+        self.summary = self.dir / "summary.txt"
+        self.change = collect_change(base)
+        self.ratchet = cfg.mode == "ratchet"
+        self.any_source = False
+
+    # -- reporting
+    def note(self, kind: str, text: str) -> None:
+        with self.summary.open("a", encoding="utf-8") as fh:
+            fh.write(f"{kind}: {text}\n")
+
+    def stage(self, name: str) -> None:
+        print(f"\n== gate: {name}", flush=True)
+        self.note("stage", name)
+
+    def fail(self, text: str, detail: list = ()) -> None:
+        self.failures.append(text)
+        print(f"GATE FAIL: {text}")
+        for line in list(detail)[:20]:
+            print(f"    {line}")
+        if len(detail) > 20:
+            print(f"    … {len(detail) - 20} more in the log")
+        self.note("FAIL", text + "".join(f"\n    {d}" for d in list(detail)[:20]))
+
+    def debt(self, text: str) -> None:
+        self.debts.append(text)
+        self.note("DEBT", text)
+
+    def skipped(self, name: str) -> bool:
+        if name in self.skip:
+            self.note("SKIPPED", f"{name} (GATE_SKIP)")
+            return True
+        return False
+
+    def log(self, name: str) -> Path:
+        return self.dir / name.replace("/", "_")
+
+    # -- the run
+    def run(self) -> int:
+        cfg, ch = self.cfg, self.change
+        head = git("rev-parse", "--short", "HEAD").strip()
+        self.note("gate", f"base {self.base[:10]}, head {head}, mode {cfg.mode}, {time.strftime('%F %T')}")
+        self.stage(f"files: {len(ch.files)} changed since {self.base[:10]} (mode {cfg.mode})")
+        if not ch.files and os.environ.get("GATE_ALLOW_EMPTY") != "1":
+            self.fail(f"nothing changed since {self.base[:10]} — wrong base, or work on {cfg.main} itself")
+        if not self.skipped("verify"):
+            self.stage("verify")
+            if not cfg.verify:
+                self.fail("no verify command in .ub/config ([ub] verify = lint, types, boundaries, tests)")
+            else:
+                rc, _ = run(cfg.verify, ROOT, self.log("verify.log"), shell=True)
+                if rc:
+                    self.fail(f"verify failed: {cfg.verify} (.ub/out/gate/verify.log)")
+        for lang in cfg.langs:
+            self.language(lang)
+        self.structure()
+        return self.result()
+
+    def is_source(self, lang: Lang, path: str) -> bool:
+        local = lang.local(path)
+        return (lang.in_src(path) and path.endswith(EXT[lang.name]) and not TEST_RE[lang.name].search(local)
+                and not NOT_PRODUCT.search(path) and not (self.cfg.exclude and self.cfg.exclude.search(path))
+                and (ROOT / path).is_file())
+
+    def language(self, lang: Lang) -> None:
+        ad = ADAPTERS[lang.name](lang, self.cfg)
+        candidates = [f for f in self.change.files if self.is_source(lang, f)]
+        sources = []
+        for f in candidates:
+            if generated(ROOT / f):
+                self.note("NOTE", f"not judged, generated: {f}")
+            else:
+                sources.append(f)
+        tests = [f for f in self.change.files if lang.owns(f) and f.endswith(EXT[lang.name])
+                 and TEST_RE[lang.name].search(lang.local(f)) and (ROOT / f).is_file()]
+        tested = sorted({lang.repo_path(s) for t in tests for s in ad.tested_by(lang.local(t))} - set(sources))
+        self.note("files", f"{lang.name}: sources {len(sources)}, tests {len(tests)}, "
+                           f"sources of changed tests {len(tested)}")
+        if not sources and not tested:
+            return
+        self.any_source = self.any_source or bool(sources)
+        setup = lang.opts.get("setup", "").strip()
+        if setup:
+            rc, _ = run(setup, ROOT, self.log(f"setup-{lang.name}.log"), shell=True)
+            if rc:
+                return self.fail(f"{lang.name} setup failed: {setup} (.ub/out/gate/setup-{lang.name}.log)")
+        if sources and not self.skipped("crap"):
+            self.crap(lang, ad, sources)
+        if sources and not self.skipped("dry"):
+            self.dry(lang, sources)
+        if not self.skipped("mutation"):
+            self.mutation(lang, ad, sources, tested, bool(tests))
+
+    def crap(self, lang: Lang, ad: Adapter, sources: list) -> None:
+        limit = self.cfg.crap_max
+        self.stage(f"CRAP ({lang.name}, crapper, under {limit:g})")
+        log = self.log(f"crap-{lang.name}.log")
+        if lang.name == "typescript":
+            bare = [f for f in sources if not ts_specs(lang.root, [lang.local(f)])]
+            if bare:
+                self.fail("no spec beside a changed TS module (name.spec.ts or name.test.ts)", bare)
+        try:
+            rc, out = ad.crap([lang.local(f) for f in sources], log)
+        except StageFail as e:
+            return self.fail(f"{lang.name}: {e}")
+        if rc or "Wrote " not in out:
+            return self.fail(f"crapper failed ({rel(log)})")
+        baseline = load_baseline() if self.ratchet else {}
+        bad = []
+        for name, ns, crap in crap_rows(out):
+            if crap_value(crap) < limit:
+                continue
+            was = baseline.get((lang.name, ns, name))
+            if was is not None and crap_value(crap) <= crap_value(was) + 0.05:
+                self.debt(f"CRAP {crap} {ns} {name} — in the baseline ({was}), not worse; lower it when it is cheap")
+            else:
+                bad.append(f"{ns} {name}: CRAP {crap}" + (f" (baseline {was})" if was else ""))
+        if bad:
+            hint = "" if not self.ratchet or BASELINE.exists() else "; ratchet mode has no baseline yet: just ub-baseline"
+            self.fail(f"CRAP >= {limit:g} or no coverage: {len(bad)} function(s) ({rel(log)}){hint}", bad)
+
+    def dry(self, lang: Lang, sources: list) -> None:
+        threshold = self.cfg.dry_threshold
+        self.stage(f"DRY ({lang.name}, dryer {threshold})")
+        log = self.log(f"dry-{lang.name}.log")
+        rc, out = run([tool("dryer"), "--root", ".", *lang.src_args(), "--threshold", threshold], lang.root, log)
+        if rc:
+            return self.fail(f"dryer failed ({rel(log)})")
+        changed, bad = set(sources), []
+        for score, members in dry_groups(out):
+            paths = [(lang.repo_path(p), a, b) for p, a, b in members]
+            if not any(p in changed for p, _, _ in paths):
+                continue
+            text = f"score {score}: " + ", ".join(f"{p}:{a}-{b}" for p, a, b in paths)
+            if not self.ratchet or any(p in changed and self.change.touches(p, a, b) for p, a, b in paths):
+                bad.append(text)
+            else:
+                self.debt(f"duplicate in a touched file, outside the changed lines — {text}")
+        if bad:
+            self.fail(f"{len(bad)} duplicate(s) touching the change ({rel(log)})", bad)
+
+    def mutation(self, lang: Lang, ad: Adapter, sources: list, tested: list, tests_changed: bool) -> None:
+        self.stage(f"mutation ({lang.name}, mutator)")
+        if lang.name == "typescript" and not ad.overlay_ready():
+            return self.fail("the vitest config lacks the mutator overlay plugin: add "
+                             ".ub/snippets/vitest-mutator-overlay.ts.txt to it (the ub-setup skill does it)")
+        for path in sources + tested:
+            self.mutate_one(lang, ad, path, path in tested, tests_changed)
+
+    def mutate_one(self, lang: Lang, ad: Adapter, path: str, tested_only: bool, tests_changed: bool) -> None:
+        local = lang.local(path)
+        flags = []
+        # mutator keeps a mutant killed while its function is unchanged; a weakened test would
+        # hide behind that, so changed tests rerun every site.
+        if tests_changed:
+            flags.append("--mutate-all")
+        lines = None if tested_only else self.change.lines(path)
+        if self.ratchet and lines is not None:
+            if not lines:
+                return
+            flags += ["--lines", ",".join(str(n) for n in sorted(lines))]
+        before = (snapshot(lang, local, self.base) or snapshot(lang, local)) if tests_changed else {}
+        log = self.log(f"mutate-{path}.log")
+        print(f"   {path} {' '.join(f for f in flags if not f[0].isdigit())}".rstrip(), flush=True)
+        rc, out = ad.mutate(local, flags, log)
+        if rc not in (0, 3):
+            why = "the tests fail without any mutant" if rc == 2 else "see the log"
+            return self.fail(f"mutator could not run on {path}, exit {rc}: {why} ({rel(log)})")
+        sites = [(kind, lang.repo_path(p), int(n), op.strip()) for kind, p, n, op in SITE_RE.findall(out)]
+        after = snapshot(lang, local)
+        regressions = [describe_site(k) for k, v in before.items() if v == "killed" and after.get(k) in ("survived", "uncovered")]
+        if regressions:
+            self.fail(f"{path}: {len(regressions)} mutant(s) the tests killed before now survive — "
+                      f"a changed test stopped checking them ({rel(log)})", regressions)
+        if self.ratchet and tested_only:
+            if sites:
+                self.debt(f"{path}: {len(sites)} surviving or uncovered mutant(s) older than this change")
+            return
+        bad = [s for s in sites if not self.ratchet or self.change.touches(path, s[2], s[2])]
+        old = len(sites) - len(bad)
+        if old:
+            self.debt(f"{path}: {old} surviving or uncovered mutant(s) outside the changed lines")
+        if bad:
+            survived = sum(1 for s in bad if s[0] == "SURVIVED")
+            hint = []
+            total = TOTAL_RE.search(out)
+            if total and int(total[1]) == 0 and int(total[2]) >= 3:
+                hint = ["no mutant was killed at all: the tests may load the original file, not mutator's "
+                        "copy (an editable install, or a bundler following symlinks) — ub doctor"]
+            self.fail(f"mutants in {path}: {survived} survived, {len(bad) - survived} uncovered ({rel(log)})",
+                      [f"{k.lower()} line {n}: {op}" for k, _, n, op in bad] + hint)
+
+    def structure(self) -> None:
+        if not self.any_source or self.cfg.structure == "off" or self.skipped("structure"):
+            return
+        if not POLICY.exists():
+            self.note("SKIPPED", "structure — no .ub/uml/policy.edn")
+            return
+        self.stage("structure (uml-viewer)")
+        log = self.log("uml.log")
+        rc, why = uml_ir(log)
+        if rc is None:
+            print(f"skipped: {why}")
+            self.note("SKIPPED", f"structure — {why}")
+        elif rc:
+            self.fail(f"uml-viewer could not build the diagram ({rel(log)})")
+        else:
+            violating = DIAGRAM.read_text(encoding="utf-8").count(":violating true")
+            if violating:
+                self.fail(f"{violating} dependency edge(s) break the Dependency Rule (just uml)")
+
+    def result(self) -> int:
+        print()
+        if self.debts:
+            print(f"debt in the touched code, not red in ratchet mode: {len(self.debts)} item(s) "
+                  f"(.ub/out/gate/summary.txt, DEBT lines) — leave it lower than you found it")
+        skipped = f" (skipped: {','.join(sorted(self.skip))})" if self.skip else ""
+        if self.failures:
+            self.note("RESULT", f"RED ({len(self.failures)})")
+            print(f"GATE RED: {len(self.failures)} problem(s)")
+            for f in self.failures:
+                print(f" - {f}")
+            return 1
+        self.note("RESULT", f"GREEN{skipped}")
+        print(f"GATE GREEN{skipped}")
+        return 0
+
+
+# ---------------------------------------------------------------- review by another model
+
+LOCKFILES = ["*.lock", "*pnpm-lock.yaml", "*package-lock.json", "*go.sum", "*.metrics/*", ".ub/out/*"]
+
+
+def review_prompt(base: str, card: str) -> str:
+    parts = [(UB / "review.md").read_text(encoding="utf-8"), ""]
+    if card:
+        parts += ["## Card", card, ""]
+    parts += ["## Commits", git("log", "--format=- %h %s", f"{base}..HEAD").rstrip() or "(none yet)", ""]
+    summary = OUT / "gate" / "summary.txt"
+    parts += ["## Gate (.ub/out/gate/summary.txt of the last `just gate`: stages, skips, debt, result)",
+              summary.read_text(encoding="utf-8") if summary.exists() else "no gate summary — `just gate` was not run", ""]
+    diff = git("diff", base, "--", ".", *[f":(exclude){p}" for p in LOCKFILES])
+    # Files the task has not committed yet are often most of it; git diff does not show them.
+    for f in git("ls-files", "-z", "--others", "--exclude-standard").split("\0"):
+        if not f or f.startswith(".ub/out/") or (ROOT / f).stat().st_size > 200_000:
+            continue
+        diff += subprocess.run(["git", "diff", "--no-index", "--", "/dev/null", f], cwd=ROOT,
+                               capture_output=True, text=True, errors="replace").stdout
+    parts += [f"## Diff (merge-base {base[:10]} -> working tree; lock files and .metrics excluded)",
+              "```diff", diff.rstrip(), "```"]
+    return "\n".join(parts) + "\n"
+
+
+def run_reviewer(name: str, prompt: Path, answer: Path, err: Path, turns: str) -> str:
+    """Run one reviewer; returns "" when it answered with a verdict, else why not."""
+    if not shutil.which(name):
+        return "not installed"
+    if name == "grok":
+        cmd, stdin = ["grok", "--prompt-file", str(prompt), "--cwd", str(ROOT), "--permission-mode", "plan",
+                      "--disable-web-search", "--max-turns", turns], None
+    elif name == "codex":
+        cmd, stdin = ["codex", "exec", "--sandbox", "read-only", "-C", str(ROOT), "-"], prompt
+    elif name == "claude":
+        cmd, stdin = ["claude", "-p", "--permission-mode", "plan"], prompt
+    else:
+        return "unknown reviewer (grok, codex, claude)"
+    limit = int(os.environ.get("REVIEW_TIMEOUT", "1800"))
+    with answer.open("w") as out, err.open("a") as e:
+        e.write(f"\n--- {name} {time.strftime('%F %T')}\n")
+        e.flush()
+        fin = stdin.open() if stdin else subprocess.DEVNULL
+        try:
+            rc = subprocess.run(cmd, cwd=ROOT, stdin=fin, stdout=out, stderr=e, timeout=limit).returncode
+        except subprocess.TimeoutExpired:
+            return f"no verdict in {limit}s (REVIEW_TIMEOUT)"
+        finally:
+            if stdin:
+                fin.close()
+    if rc:
+        tail = [l for l in err.read_text(errors="replace").splitlines() if l.strip()][-1:]
+        return f"exit {rc}: {tail[0][:200] if tail else 'no message'}"
+    if not re.search(r"^\s*VERDICT:", answer.read_text(errors="replace"), re.M):
+        return "answered without a VERDICT line"
+    return ""
+
+
+def cmd_review(args: list) -> int:
+    cfg = load_config()
+    base = args[0] if args and args[0] else default_base(cfg)
+    if not ref_exists(base):
+        print(f"review: no base commit (merge-base with {cfg.main}?)")
+        return 2
+    card = args[1] if len(args) > 1 else ""
+    d = OUT / "review"
+    d.mkdir(parents=True, exist_ok=True)
+    prompt, answer, err = d / "prompt.md", d / "answer.md", d / "error.log"
+    prompt.write_text(review_prompt(base, card), encoding="utf-8")
+    print(f"review: prompt {prompt.stat().st_size} bytes, reviewers in order: {' '.join(dict.fromkeys(cfg.reviewers))}")
+    # Usage limits are the norm (Martin moved between Grok and Codex for weeks): when one model
+    # fails, the next one reviews.
+    err.write_text("")
+    for name in dict.fromkeys(cfg.reviewers):
+        print(f"review: asking {name}…", flush=True)
+        why = run_reviewer(name, prompt, answer, err, cfg.review_turns)
+        if not why:
+            print(f"review by {name}:\n")
+            text = answer.read_text(errors="replace")
+            print(text)
+            verdict = re.search(r"^\s*VERDICT:\s*(\w+)", text, re.M)  # the first one counts
+            return 0 if verdict and verdict[1].upper() == "PASS" else 1
+        print(f"review: {name} did not review it — {why}")
+    print("review: no model answered — the task is NOT reviewed; tell the owner (.ub/out/review/error.log)")
+    return 2
+
+
+# ---------------------------------------------------------------- baseline, doctor
+
+
+def cmd_baseline() -> int:
+    """Ratchet mode: the CRAP debt of today. The gate tolerates these functions while they do
+    not get worse; anything else at CRAP >= the limit is red."""
+    cfg = load_config()
+    rows, lines = [], []
+    d = OUT / "baseline"
+    for lang in cfg.langs:
+        ad = ADAPTERS[lang.name](lang, cfg)
+        setup = lang.opts.get("setup", "").strip()
+        if setup and run(setup, ROOT, d / f"setup-{lang.name}.log", shell=True)[0]:
+            raise UbError(f"{lang.name} setup failed (.ub/out/baseline/setup-{lang.name}.log)")
+        print(f"{lang.name}: crapper over {lang.repo_path(lang.src) or '.'} (runs the tests with coverage)…", flush=True)
+        try:
+            rc, out = ad.crap_all(d / f"crap-{lang.name}.log")
+        except StageFail as e:
+            raise UbError(f"{lang.name}: {e}")
+        if rc or "Wrote " not in out:
+            raise UbError(f"crapper failed (.ub/out/baseline/crap-{lang.name}.log)")
+        scored = crap_rows(out)
+        debt = [(lang.name, ns, name, crap) for name, ns, crap in scored if crap_value(crap) >= cfg.crap_max]
+        rows += debt
+        _, dry = run([tool("dryer"), "--root", ".", *lang.src_args(), "--threshold", cfg.dry_threshold],
+                     lang.root, d / f"dry-{lang.name}.log")
+        lines.append(f"{lang.name}: {len(scored)} functions, {len(debt)} at CRAP >= {cfg.crap_max:g} or without "
+                     f"coverage, {len(dry_groups(dry))} duplicate groups at {cfg.dry_threshold}")
+    head = git("rev-parse", "--short", "HEAD").strip()
+    BASELINE.parent.mkdir(parents=True, exist_ok=True)
+    BASELINE.write_text(
+        f"# ub baseline, {time.strftime('%F')} at {head}: CRAP debt the gate tolerates in ratchet mode while it\n"
+        "# does not grow. Regenerate it only deliberately (just ub-baseline), with the owner.\n"
+        + "".join("\t".join(r) + "\n" for r in rows), encoding="utf-8")
+    (BASELINE.parent / "summary.txt").write_text(f"{time.strftime('%F')} at {head}\n" + "\n".join(lines) + "\n")
+    print("\n".join(lines))
+    print(f"wrote {rel(BASELINE)} ({len(rows)} functions) — commit it with the owner's approval")
+    return 0
+
+
+def check(ok, text: str) -> int:
+    mark = {True: "ok  ", False: "FIX ", None: "note"}[ok]
+    print(f"  {mark} {text}")
+    return 1 if ok is False else 0
+
+
+def cmd_doctor() -> int:
+    bad = 0
+    print("tools")
+    py = python311()
+    bad += check(bool(py), f"Python >= 3.11 for Martin's tools: {py}" if py else "no Python >= 3.11 on PATH (brew install python@3.12)")
+    bad += check(bool(shutil.which("git")), "git")
+    bad += check(bool(shutil.which("just")) or None, "just" if shutil.which("just") else "just is missing (brew install just) — or run python3 .ub/ub …")
+    check(tools_ready() or None, f"crapper, mutator, dryer in {tools_dir()}" if tools_ready() else "Martin's tools are not installed yet: just ub-tools (the gate does it on first run)")
+    print("configuration")
+    try:
+        cfg = load_config()
+    except UbError as e:
+        check(False, str(e))
+        return 1
+    bad += check(bool(cfg.langs), "languages: " + (", ".join(f"{l.name} ({l.repo_path(l.src) or '.'})" for l in cfg.langs) or "none — add [python], [go] or [typescript] to .ub/config"))
+    bad += check(bool(cfg.verify), f"verify: {cfg.verify}" if cfg.verify else "no verify command")
+    jf = next((ROOT / n for n in ("justfile", "Justfile", ".justfile") if (ROOT / n).exists()), CONFIG)
+    for path in dict.fromkeys((CONFIG, POLICY, jf)):
+        if path.exists():
+            for line in path.read_text(errors="ignore").splitlines():
+                if "TODO(ub-setup)" in line:
+                    check(None, f"{rel(path)}: {line.strip().lstrip('#; ').strip()}")
+    main_ok = ref_exists(cfg.main) or ref_exists(f"origin/{cfg.main}")
+    bad += check(main_ok or None, f"main branch: {cfg.main}" if main_ok else f"no branch {cfg.main} yet (main = … in .ub/config)")
+    if cfg.mode == "ratchet":
+        bad += check(BASELINE.exists(), f"ratchet mode, baseline {rel(BASELINE)}" if BASELINE.exists() else "ratchet mode without a baseline: just ub-baseline")
+    else:
+        check(True, "strict mode: everything in a changed file must be clean")
+    for lang in cfg.langs:
+        print(lang.name)
+        for ok, text in ADAPTERS[lang.name](lang, cfg).problems():
+            bad += check(ok, text)
+    print("review by another model")
+    found = [r for r in dict.fromkeys(cfg.reviewers) if shutil.which(r)]
+    bad += check(bool(found), f"installed: {', '.join(found)} (login and credits are checked only by just review)" if found else "none of " + ", ".join(cfg.reviewers) + " is installed")
+    print("structure (uml-viewer)")
+    if POLICY.exists():
+        levels = re.search(r"^[^;]*:levels\s*\[\s*\[", POLICY.read_text(), re.M) is not None
+        check(levels or None, "policy has :levels (the Dependency Rule)" if levels else "policy has no :levels yet — no edge can be red")
+        java, clj = shutil.which("java", path=java_path()), shutil.which("clojure", path=java_path())
+        check(bool(java and clj) or None, "Java and Clojure CLI" if java and clj else "no Java 21 / Clojure CLI — the structure stage is skipped (brew install openjdk@21 clojure/tools/clojure)")
+    else:
+        check(None, "no .ub/uml/policy.edn — the structure stage is skipped")
+    print("agent")
+    for p in (".claude/skills/ub-mode/SKILL.md", ".claude/settings.json"):
+        bad += check((ROOT / p).exists(), p)
+    print("\nready" if not bad else f"\n{bad} thing(s) to fix")
+    return 1 if bad else 0
+
+
+# ---------------------------------------------------------------- uml-viewer
+
+
+def java_path() -> str:
+    extra = [d for d in ("/opt/homebrew/opt/openjdk@21/bin", "/usr/local/opt/openjdk@21/bin",
+                         str(Path.home() / ".local" / "bin")) if Path(d).is_dir()]
+    return os.pathsep.join(extra + [os.environ.get("PATH", "")])
+
+
+def uml_dir() -> Path:
+    return CACHE / f"uml-viewer-{UML_REF}"
+
+
+def uml_install() -> None:
+    d = uml_dir()
+    with locked("uml"):
+        if not (d / ".git").is_dir():
+            subprocess.run(["git", "clone", "-q", UML_REPO, str(d)], check=True)
+        if not git("rev-parse", "HEAD", cwd=d).startswith(UML_REF):
+            subprocess.run(["git", "-C", str(d), "fetch", "-q", "origin"], check=True)
+            subprocess.run(["git", "-C", str(d), "checkout", "-q", UML_REF], check=True)
+    print(f"uml-viewer {git('log', '-1', '--format=%h %s', cwd=d).strip()} in {d}")
+
+
+def uml_ir(log: Path):
+    """Regenerate .ub/uml/project.edn from the policy: (exit code, None) or (None, why skipped)."""
+    path = java_path()
+    if not (shutil.which("java", path=path) and shutil.which("clojure", path=path)):
+        return None, "no Java 21 or Clojure CLI (brew install openjdk@21 clojure/tools/clojure)"
+    if not uml_dir().exists():
+        uml_install()
+    deps = '{:deps {uml-viewer/uml-viewer {:local/root "%s"}}}' % uml_dir()
+    rc, _ = run(["clojure", "-Sdeps", deps, "-M", "-m", "uml-viewer.main.ir-generator", str(POLICY), str(DIAGRAM)],
+                ROOT, log, env={"PATH": path})
+    return rc, None
+
+
+def uml_metrics() -> None:
+    """Whole-project CRAP per language and the mutation snapshots, for the diagram's colours."""
+    cfg = load_config()
+    target = UB / "uml" / ".metrics"
+    shutil.rmtree(target, ignore_errors=True)
+    (target / "mutate").mkdir(parents=True)
+    entries = []
+    for lang in cfg.langs:
+        rc, out = ADAPTERS[lang.name](lang, cfg).crap_all(OUT / "uml" / f"crap-{lang.name}.log")
+        crap = lang.root / ".metrics" / "crap.edn"
+        if rc or not crap.exists():
+            raise UbError(f"crapper failed (.ub/out/uml/crap-{lang.name}.log)")
+        text = crap.read_text(encoding="utf-8")
+        entries.append(text[text.find("[") + 1:text.rfind("]")].strip("\n"))
+        snaps = lang.root / ".metrics" / "mutate"
+        if snaps.is_dir():
+            shutil.copytree(snaps, target / "mutate", dirs_exist_ok=True)
+    (target / "crap.edn").write_text("{:entries [\n" + "\n".join(e for e in entries if e) + "\n]}\n")
+    print(f"uml metrics: {rel(target)}")
+
+
+def cmd_uml(args: list) -> int:
+    action = args[0] if args else "open"
+    if action == "install":
+        uml_install()
+    elif action == "metrics":
+        uml_metrics()
+    elif action in ("ir", "open"):
+        if not POLICY.exists():
+            raise UbError("no .ub/uml/policy.edn (the ub-setup skill writes it)")
+        if action == "open":
+            uml_install()
+            uml_metrics()
+        rc, why = uml_ir(OUT / "uml" / "ir.log")
+        if rc is None:
+            raise UbError(why)
+        if rc:
+            raise UbError("the IR generator failed (.ub/out/uml/ir.log)")
+        print(f"diagram: {rel(DIAGRAM)}, violating edges: {DIAGRAM.read_text().count(':violating true')}")
+        if action == "open":
+            deps = '{:deps {uml-viewer/uml-viewer {:local/root "%s"} quil/quil {:mvn/version "%s"}}}' % (uml_dir(), QUIL)
+            log = (OUT / "uml" / "viewer.log").open("a")
+            p = subprocess.Popen(["clojure", "-Sdeps", deps, "-M", "-m", "uml-viewer.main.uml-viewer", str(DIAGRAM)],
+                                 cwd=ROOT, env=dict(os.environ, PATH=java_path()), stdout=log, stderr=log,
+                                 stdin=subprocess.DEVNULL, start_new_session=True)
+            print(f"uml-viewer started (pid {p.pid}), log .ub/out/uml/viewer.log")
+    else:
+        raise UbError("usage: ub uml [open|install|metrics|ir]")
+    return 0
+
+
+# ---------------------------------------------------------------- coverage commands for mutator
+
+
+def cmd_go_cover(args: list) -> int:
+    """Go coverage of these packages into target/coverage/go/coverage.out. The profile names
+    files by import path; mutator matches them to files by path suffix, so the module path is
+    replaced by the module's directory name (finteam/internal/x.go -> backend/internal/x.go)."""
+    root, pkgs = Path(args[0]), args[1:] or ["./..."]
+    profile = root / "target" / "coverage" / "go" / "coverage.out"
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    rc = subprocess.call(["go", "test", "-count=1", f"-coverprofile={profile}", *pkgs], cwd=root)
+    m = re.search(r"^module\s+(\S+)", (root / "go.mod").read_text(), re.M)
+    if profile.exists() and m:
+        text = re.sub(rf"^{re.escape(m[1])}/", f"{root.resolve().name}/", profile.read_text(), flags=re.M)
+        profile.write_text(text)
+    return rc
+
+
+def cmd_ts_cover(args: list) -> int:
+    """LCOV in coverage/lcov.info: of these modules from their own specs, or of the whole suite
+    when no module is named."""
+    root, files = Path(args[0]), args[1:]
+    shutil.rmtree(root / "coverage", ignore_errors=True)
+    cmd = ts_vitest(root) + ["run", "--coverage.enabled=true", "--coverage.reporter=lcov",
+                             "--coverage.reportsDirectory=coverage"]
+    if files:
+        specs = ts_specs(root, files)
+        if not specs:
+            print(f"no spec beside {' '.join(files)}: no coverage", file=sys.stderr)
+            return 0
+        cmd += [f"--coverage.include={f}" for f in files] + specs
+    return subprocess.call(cmd, cwd=root)
+
+
+# ---------------------------------------------------------------- entry
+
+
+def main(argv: list) -> int:
+    cmd, args = (argv[0], argv[1:]) if argv else ("help", [])
+    try:
+        if cmd == "gate":
+            cfg = load_config()
+            base = args[0] if args and args[0] else default_base(cfg)
+            if not ref_exists(base):
+                print(f"GATE RED: no base commit (the merge-base with {cfg.main}? pass one: just gate <commit>)")
+                return 2
+            return Gate(cfg, base).run()
+        if cmd == "review":
+            return cmd_review(args)
+        if cmd == "baseline":
+            return cmd_baseline()
+        if cmd == "doctor":
+            return cmd_doctor()
+        if cmd == "uml":
+            return cmd_uml(args)
+        if cmd == "tools":
+            if not args or args[0] == "install":
+                tools_install()
+                return 0
+            if args[0] in PINS:
+                os.execv(tool(args[0]), [args[0], *args[1:]])
+            raise UbError("usage: ub tools [install|crapper|mutator|dryer ARGS...]")
+        if cmd == "go-cover":
+            return cmd_go_cover(args)
+        if cmd == "ts-cover":
+            return cmd_ts_cover(args)
+        print(__doc__)
+        return 0 if cmd in ("help", "-h", "--help") else 2
+    except UbError as e:
+        print(f"ub: {e}", file=sys.stderr)
+        return 2
+    except subprocess.CalledProcessError as e:
+        print(f"ub: {shlex.join(str(c) for c in e.cmd)} failed with exit {e.returncode}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
