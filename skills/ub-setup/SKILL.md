@@ -15,10 +15,19 @@ owner, not to guess them. Work on a branch (`ub-setup`), commit in small steps, 
 Edits under `.ub/`, `.claude/skills/` and `.metrics/` ask the owner by design — say what you are
 changing and why before each one.
 
-## 0. Look first
+## 0. Look first — the project's own rules come first
 * Run `just ub-doctor` (or `python3 .ub/ub doctor`) and read `.ub/config`.
-* Read the README, the build files, the CI config and the test layout, so your proposals fit
-  the project as it is.
+* Read what the project already says about itself: `AGENTS.md`, `CLAUDE.md` (outside the
+  ub-kit block), `.cursor/rules`, `.github/copilot-instructions.md`, `CONTRIBUTING.md`,
+  `ARCHITECTURE.md`, `docs/adr/`, `docs/architecture*`, the README; then the build files, the CI
+  config, the existing lint and boundary configs and the test layout.
+* What is written there wins: its layers become `:levels`, its checks become verify, its
+  conventions stay. The kit adds the gate and the review; it does not replace the project's
+  rules or invent an architecture beside the one described.
+* Where a written rule contradicts ub-mode or the gate (for example "no tests for UI code"
+  while the gate mutates it, or another review process), list the conflict for the owner and
+  let them decide: an `exclude`, a project rule in AGENTS.md, or a change to the rule.
+* Do not move or rewrite their rule files. Only the ub-kit block is the kit's.
 * Tell the owner in a few lines what you found and what is left, then go through the steps
   below; skip a step that is already done.
 
@@ -63,7 +72,8 @@ changing and why before each one.
   `[ub] exclude` (a regex).
 
 ## 5. The diagram (`.ub/uml/policy.edn`)
-* Set `:levels` to the owner's layers, inner first, and fix `:src` / `:prefix` if the TODO
+* Set `:levels` to the layers the project's docs or boundary config already define (ask the
+  owner only when nothing is written or the code disagrees with the docs), inner first, and fix `:src` / `:prefix` if the TODO
   says so. Run `just uml ir`; the summary line counts violating edges. Needs Java 21 and the
   Clojure CLI; without them the gate skips this stage and says so — tell the owner.
 * Existing violations are architecture debt: list them for the owner; do not hide them with

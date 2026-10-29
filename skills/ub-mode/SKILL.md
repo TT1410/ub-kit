@@ -9,9 +9,11 @@ description: >
 # ub-mode
 
 Source: Robert C. Martin, `ub-mode` (github.com/unclebob/ub-mode, Oct 2026), with the ub-kit
-gate (`.ub/`). The project's own rules are in `AGENTS.md` / `CLAUDE.md`; the block managed by
-ub-kit there names the gate's mode and the exact commands (`just gate`, or `just ub gate` when
-the project's justfile already had those names).
+gate (`.ub/`). The project's own rules and architecture (`AGENTS.md`, `CLAUDE.md`, ADRs,
+architecture docs) come first: this skill is how you work, they say what the project is. When
+the two disagree, ask the owner. The block managed by ub-kit in AGENTS.md / CLAUDE.md names
+the gate's mode and the exact commands (`just gate`, or `just ub gate` when the project's
+justfile already had those names).
 
 Every time you are asked to make a change follow:
 * First Make it Work.
