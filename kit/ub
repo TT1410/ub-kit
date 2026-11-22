@@ -778,7 +778,9 @@ class Gate:
                 sources.append(f)
         tests = [f for f in self.change.files if lang.owns(f) and f.endswith(EXT[lang.name])
                  and TEST_RE[lang.name].search(lang.local(f)) and (ROOT / f).is_file()]
-        tested = sorted({lang.repo_path(s) for t in tests for s in ad.tested_by(lang.local(t))} - set(sources))
+        # A changed test judges its subject's mutants, but an excluded subject stays excluded.
+        tested = sorted({lang.repo_path(s) for t in tests for s in ad.tested_by(lang.local(t))
+                         if not (self.cfg.exclude and self.cfg.exclude.search(lang.repo_path(s)))} - set(sources))
         self.note("files", f"{lang.name}: sources {len(sources)}, tests {len(tests)}, "
                            f"sources of changed tests {len(tested)}")
         if not sources and not tested:
