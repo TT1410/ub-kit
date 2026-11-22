@@ -10,6 +10,7 @@ Run from the repository; the justfile wraps every command:
   audit CONCERN [BASE]      another model audits one concern (architecture, coverage,
                             concurrency, security, api — .ub/audits/) of the project or of
                             what changed since BASE; exits like review.
+  soak [N] [COMMAND]        run COMMAND (default: verify) N times (20); a race shows as a flaky run
   baseline                  ratchet mode: record today's CRAP debt; only new debt is red
   doctor                    check the tools and the configuration, list what is left to do
   uml [open|install|metrics|ir]                  uml-viewer: modules, dependencies, Dependency Rule
@@ -32,7 +33,9 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -131,6 +134,7 @@ class Config:
     review_turns: str
     langs: list
     acceptance: str = ""
+    jobs: int = 2
 
 
 def load_config() -> Config:
@@ -161,6 +165,7 @@ def load_config() -> Config:
         review_turns=ub.get("review_turns", "30").strip(),
         langs=langs,
         acceptance=ub.get("acceptance", "").strip(),
+        jobs=max(1, int(ub.get("mutation_jobs", "2") or 2)),
     )
 
 
@@ -461,8 +466,18 @@ class Adapter:
     def crap_all(self, log: Path):
         raise NotImplementedError
 
-    def mutate(self, file: str, flags: list, log: Path):
+    def mutate(self, file: str, flags: list, log: Path, reuse: bool = False):
+        """Mutate one file; with reuse, read the coverage cover_all wrote instead of running it."""
         raise NotImplementedError
+
+    def cover_all(self, files: list, log: Path) -> None:
+        """One coverage run for all these files, so their mutators can run side by side with
+        --use-existing-coverage instead of each rewriting the same coverage report."""
+        raise NotImplementedError
+
+    def snapshot_group(self, file: str) -> str:
+        """Files whose mutator snapshots may share a file must not be mutated at once."""
+        return file
 
     def tested_by(self, test: str) -> list:
         """Product files a changed test file tests, language-root paths."""
@@ -487,10 +502,16 @@ class PythonAdapter(Adapter):
     def crap_all(self, log):
         return run([tool("crapper"), "--root", ".", *self._cov(), *self.lang.src_args()], self.root, log)
 
-    def mutate(self, file, flags, log):
+    def mutate(self, file, flags, log, reuse=False):
         test = self.lang.opts.get("test", "").strip()
-        return run([tool("mutator"), "--root", ".", *self.workers(), *self._cov(),
+        cov = ["--use-existing-coverage"] if reuse else self._cov()
+        return run([tool("mutator"), "--root", ".", *self.workers(), *cov,
                     *(["--test-command", test] if test else []), *flags, file], self.root, log)
+
+    def cover_all(self, files, log):
+        rc, out = self.crap(files, log)
+        if rc or "Wrote " not in out:
+            raise StageFail(f"the coverage run failed ({rel(log)})")
 
     def tested_by(self, test):
         name = Path(test).name
@@ -548,12 +569,19 @@ class GoAdapter(Adapter):
         self._cover(["./..."], log.with_name(log.stem + "-cover.log"))
         return run([tool("crapper"), "--root", ".", "--use-existing-coverage", *self.lang.src_args()], self.root, log)
 
-    def mutate(self, file, flags, log):
+    def mutate(self, file, flags, log, reuse=False):
         pkg = self.package(file)
         cover = shlex.join([sys.executable, str(UB / "ub"), "go-cover", str(self.root), pkg])
+        cov = ["--use-existing-coverage"] if reuse else ["--coverage-command", cover]
         test = self.lang.opts.get("test", "").strip() or f"go test -count=1 {pkg}"
-        return run([tool("mutator"), "--root", ".", *self.workers(), "--coverage-command", cover,
+        return run([tool("mutator"), "--root", ".", *self.workers(), *cov,
                     "--test-command", test, *flags, file], self.root, log)
+
+    def cover_all(self, files, log):
+        self._cover(sorted({self.package(f) for f in files}), log)
+
+    def snapshot_group(self, file):
+        return str(Path(file).parent)  # mutator keeps one snapshot per Go package
 
     def tested_by(self, test):
         target = re.sub(r"_test\.go$", ".go", test)
@@ -592,13 +620,17 @@ class TsAdapter(Adapter):
         self._cover([], log.with_name(log.stem + "-cover.log"))
         return run([tool("crapper"), "--root", ".", "--use-existing-coverage", *self.lang.src_args()], self.root, log)
 
-    def mutate(self, file, flags, log):
+    def mutate(self, file, flags, log, reuse=False):
         specs = ts_specs(self.root, [file])
         cover = shlex.join([sys.executable, str(UB / "ub"), "ts-cover", str(self.root), file])
+        cov = ["--use-existing-coverage"] if reuse else ["--coverage-command", cover]
         test = "MUTATOR_OVERLAY=1 " + shlex.join(ts_vitest(self.root) + ["run", "--bail=1",
                                                                             *(specs or ["--passWithNoTests"])])
-        return run([tool("mutator"), "--root", ".", *self.workers(), "--coverage-command", cover,
+        return run([tool("mutator"), "--root", ".", *self.workers(), *cov,
                     "--test-command", test, *flags, file], self.root, log)
+
+    def cover_all(self, files, log):
+        self._cover(files, log)
 
     def tested_by(self, test):
         p = Path(test)
@@ -653,10 +685,11 @@ class Gate:
         self.change = collect_change(base)
         self.ratchet = cfg.mode == "ratchet"
         self.any_source = False
+        self.lock = threading.RLock()  # mutations of several files report at once
 
     # -- reporting
     def note(self, kind: str, text: str) -> None:
-        with self.summary.open("a", encoding="utf-8") as fh:
+        with self.lock, self.summary.open("a", encoding="utf-8") as fh:
             fh.write(f"{kind}: {text}\n")
 
     def stage(self, name: str) -> None:
@@ -664,6 +697,10 @@ class Gate:
         self.note("stage", name)
 
     def fail(self, text: str, detail: list = ()) -> None:
+        with self.lock:
+            self._fail(text, detail)
+
+    def _fail(self, text: str, detail: list = ()) -> None:
         self.failures.append(text)
         print(f"GATE FAIL: {text}")
         for line in list(detail)[:20]:
@@ -805,8 +842,27 @@ class Gate:
         if lang.name == "typescript" and not ad.overlay_ready():
             return self.fail("the vitest config lacks the mutator overlay plugin: add "
                              ".ub/snippets/vitest-mutator-overlay.ts.txt to it (the ub-setup skill does it)")
-        for path in sources + tested:
-            self.mutate_one(lang, ad, path, path in tested, tests_changed)
+        targets = sources + tested
+        # Mutation is the power-hungry stage (Martin, 20 Nov 2026): one coverage run for every
+        # file, then the files' mutators side by side, `mutation_jobs` at a time. Files whose
+        # snapshots share one file (a Go package) stay in one queue.
+        reuse = self.cfg.jobs > 1 and len(targets) > 1
+        if reuse:
+            try:
+                ad.cover_all([lang.local(p) for p in targets], self.log(f"cover-mutation-{lang.name}.log"))
+            except StageFail as e:
+                return self.fail(f"{lang.name}: {e}")
+        groups: dict = {}
+        for path in targets:
+            groups.setdefault(ad.snapshot_group(lang.local(path)), []).append(path)
+
+        def queue(paths: list) -> None:
+            for path in paths:
+                self.mutate_one(lang, ad, path, path in tested, tests_changed, reuse)
+
+        with ThreadPoolExecutor(max_workers=self.cfg.jobs if reuse else 1) as pool:
+            for future in [pool.submit(queue, paths) for paths in groups.values()]:
+                future.result()
 
     def snapshot_at_base(self, lang: Lang, local: str) -> dict:
         """What mutator knew at the base: the committed snapshot when the project commits
@@ -823,7 +879,8 @@ class Gate:
         state.write_text(json.dumps(current))
         return current
 
-    def mutate_one(self, lang: Lang, ad: Adapter, path: str, tested_only: bool, tests_changed: bool) -> None:
+    def mutate_one(self, lang: Lang, ad: Adapter, path: str, tested_only: bool, tests_changed: bool,
+                   reuse: bool = False) -> None:
         local = lang.local(path)
         flags = []
         # mutator keeps a mutant killed while its function is unchanged; a weakened test would
@@ -838,7 +895,7 @@ class Gate:
         before = self.snapshot_at_base(lang, local) if tests_changed else {}
         log = self.log(f"mutate-{path}.log")
         print(f"   {path} {' '.join(f for f in flags if not f[0].isdigit())}".rstrip(), flush=True)
-        rc, out = ad.mutate(local, flags, log)
+        rc, out = ad.mutate(local, flags, log, reuse)
         if rc not in (0, 3):
             why = "the tests fail without any mutant" if rc == 2 else "see the log"
             return self.fail(f"mutator could not run on {path}, exit {rc}: {why} ({rel(log)})")
@@ -1082,6 +1139,28 @@ def cmd_audit(args: list) -> int:
     return ask_reviewers(cfg, "\n".join(parts) + "\n", OUT / "audit" / concern, f"audit {concern}")
 
 
+def cmd_soak(args: list) -> int:
+    """Run a test command many times; a race shows as a run that fails now and then. Martin's
+    jitter testing (6 Nov 2026): the agent puts random delays at the critical points, then the
+    suite runs again and again. UB_SOAK_RUN holds the run's number."""
+    n = int(args[0]) if args and args[0].isdigit() else 20
+    cmd = " ".join(args[1:]).strip() or load_config().verify
+    if not cmd:
+        raise UbError("usage: ub soak [N] [COMMAND] — no command and no verify in .ub/config")
+    d = OUT / "soak"
+    shutil.rmtree(d, ignore_errors=True)
+    failed = []
+    for i in range(1, n + 1):
+        rc, _ = run(cmd, ROOT, d / f"run-{i}.log", env={"UB_SOAK_RUN": str(i)}, shell=True)
+        print(f"soak {i}/{n}: {'ok' if rc == 0 else f'FAILED (exit {rc}, .ub/out/soak/run-{i}.log)'}", flush=True)
+        if rc:
+            failed.append(i)
+        else:
+            (d / f"run-{i}.log").unlink()
+    print(f"soak: {n - len(failed)}/{n} green" + (f"; failed runs {failed} — a flaky test or a race" if failed else ""))
+    return 1 if failed else 0
+
+
 # ---------------------------------------------------------------- baseline, doctor
 
 
@@ -1312,6 +1391,8 @@ def main(argv: list) -> int:
             return cmd_review(args)
         if cmd == "audit":
             return cmd_audit(args)
+        if cmd == "soak":
+            return cmd_soak(args)
         if cmd == "baseline":
             return cmd_baseline()
         if cmd == "doctor":

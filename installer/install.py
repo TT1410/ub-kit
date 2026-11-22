@@ -25,11 +25,11 @@ from pathlib import Path
 KIT = Path(__file__).resolve().parent.parent
 VERSION = (KIT / "VERSION").read_text().strip()
 KIT_FILES = ["ub", "ub.just", "snippets/vitest-mutator-overlay.ts.txt"]
-SKILLS = ["ub-mode", "ub-setup"]
+SKILLS = ["ub-mode", "ub-setup", "ub-lead"]
 SKIP_DIRS = {"node_modules", "vendor", "dist", "build", "target", "venv", "testdata", "e2e"}
 EXT = {"python": (".py",), "go": (".go",), "typescript": (".ts", ".tsx")}
 TEST_RE = re.compile(r"(^|/)(tests?|__tests__|testdata)/|(^|/)test_[^/]*\.py$|_test\.(py|go)$|\.(test|spec)\.tsx?$|\.d\.ts$")
-OUR_RECIPES = {"gate", "review", "audit", "uml", "ub-baseline", "ub-doctor", "ub-tools"}
+OUR_RECIPES = {"gate", "review", "audit", "soak", "uml", "ub-baseline", "ub-doctor", "ub-tools"}
 AUDITS = ["architecture", "coverage", "concurrency", "security", "api"]
 BEGIN, END = "<!-- ub-kit:start", "<!-- ub-kit:end -->"
 
@@ -244,8 +244,9 @@ dry_threshold = 0.8
 exclude =
 # auto: check the Dependency Rule on the uml-viewer diagram when .ub/uml/policy.edn exists; off.
 structure = auto
-# mutator's workers per file.
+# mutator's workers per file, and how many files are mutated at once (one coverage run first).
 workers = 4
+mutation_jobs = 2
 # Review by another model, in order; when one fails the next answers. grok, codex, claude
 # (claude only when the author is not Claude).
 reviewers = grok codex
@@ -318,10 +319,13 @@ def render_block(mode: str, main: str, j: str) -> str:
     return f"""{BEGIN} — managed by ub-kit (install.sh --upgrade rewrites it); keep your own rules outside -->
 ## How tasks are worked here
 
-One task, one agent, the `ub-mode` skill (`.claude/skills/ub-mode/SKILL.md` — agents without
-skills: read it before the first change). A task is done when:
-- `{j}gate` is green: verify, CRAP < 10, no duplication (dryer 0.8), no surviving or uncovered
-  mutants, the Dependency Rule — for what changed since the merge-base with `{main}`.
+One task, one agent, the `ub-mode` skill — Robert C. Martin's text in
+`.claude/skills/ub-mode/SKILL.md` and how it runs here in `ub-kit.md` beside it (agents without
+skills: read both before the first change). A large task the owner wants delegated: the
+`ub-lead` skill. A task is done when:
+- `{j}gate` is green: verify, acceptance tests if set, CRAP < 10, no duplication (dryer 0.8),
+  no surviving or uncovered mutants, the Dependency Rule — for what changed since the
+  merge-base with `{main}`.
   Mode {mode}: {modes[mode]}
 - every finding of `{j}review` (another model, read-only) is answered; exit 2 means nobody
   reviewed it — say so, do not merge;
@@ -380,7 +384,7 @@ def render_ci(repo: Path, main: str, langs: dict) -> str:
 
 
 def ask_rules(langs: dict, ci: bool) -> list:
-    paths = ["/.ub/**", "/.claude/skills/ub-mode/**", "/.claude/skills/ub-setup/**", "/.metrics/**"]
+    paths = ["/.ub/**", "/.claude/skills/ub-mode/**", "/.claude/skills/ub-setup/**", "/.claude/skills/ub-lead/**", "/.metrics/**"]
     paths += [f"/{info['rel']}/.metrics/**" for info in langs.values() if info["rel"]]
     if ci:
         paths.append("/.github/workflows/**")
@@ -494,7 +498,8 @@ def install(repo: Path, args) -> None:
         plan.once(f".ub/audits/{concern}.md", (KIT / "kit" / "defaults" / "audits" / f"{concern}.md").read_text(),
                   f"checklist of `audit {concern}`")
     for skill in SKILLS:
-        plan.write(f".claude/skills/{skill}/SKILL.md", (KIT / "skills" / skill / "SKILL.md").read_text(), "skill")
+        for f in sorted((KIT / "skills" / skill).iterdir()):
+            plan.write(f".claude/skills/{skill}/{f.name}", f.read_text(), f"skill {skill}")
     ci = args.ci or (repo / ".github" / "workflows" / "ub-gate.yml").exists()
     plan.write(".claude/settings.json", merged_settings(plan.read(".claude/settings.json"), ask_rules(langs, ci)),
                "ask the owner before edits of the gate, its settings and the skills")

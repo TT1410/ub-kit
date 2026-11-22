@@ -13,6 +13,10 @@ review base="" card="":
 audit concern base="":
     python3 "{{source_directory()}}/ub" audit {{quote(concern)}} {{quote(base)}}
 
+# Run a test command (default: verify) n times; a race shows as a run that fails now and then (Martin's jitter testing)
+soak n="20" *cmd:
+    python3 "{{source_directory()}}/ub" soak {{n}} {{quote(cmd)}}
+
 # uml-viewer: modules, dependencies, Dependency Rule violations, CRAP and mutation colours; action: open, install, metrics, ir
 uml action="open":
     python3 "{{source_directory()}}/ub" uml {{action}}

@@ -208,6 +208,12 @@ EOF
   sed -i.bak 's#^reviewers =.*#reviewers = no-such-reviewer#' .ub/config && rm -f .ub/config.bak
   expect 2 "audit with no reviewer is not done (exit 2)" -- just audit security
   has .ub/out/audit/security/prompt.md "Concern: security" "the security checklist is in the prompt"
+  has .ub/out/gate/summary.txt "mutation (go" "two packages were mutated side by side after one coverage run"
+  [[ -f .ub/out/gate/cover-mutation-go.log ]] && ok "the shared coverage run left its log" || bad "no shared coverage run"
+  expect 0 "soak: a steady command stays green" -- just soak 3 true
+  expect 1 "soak: a flaky one is caught" -- just soak 4 'test $((UB_SOAK_RUN % 2)) = 1'
+  [[ -f .claude/skills/ub-mode/ub-kit.md && -f .claude/skills/ub-mode/LICENSE-ub-mode && -f .claude/skills/ub-lead/SKILL.md ]] \
+    && ok "ub-mode (Martin's text, licence, ub-kit.md) and ub-lead installed" || bad "skill files missing"
 }
 
 typescript_case() {
