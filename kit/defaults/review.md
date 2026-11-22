@@ -17,7 +17,9 @@ that change anything.
 1. **Behaviour.** Does the code do what the task asks — no more, no less? Missing case, extra
    behaviour, wrong edge case (empty, zero, negative, time zones, rounding, encoding).
 2. **Tests that prove nothing.** Would a test still pass if the function returned nothing or a
-   constant? Was any test or assertion weakened or deleted?
+   constant? Was any test or assertion weakened or deleted? Ceremony tests — import order, an
+   implementation detail's list membership, that a removed feature is absent — are findings too:
+   they cost every future change and protect no behaviour.
 3. **Security.** Authorization on every entry point, input checked at the boundary, no secrets or
    personal data in logs or errors.
 4. **Design.** Unnecessary complexity and bloat, a dependency that points the wrong way or should
@@ -25,7 +27,8 @@ that change anything.
    shared mutable state with more than one writer.
 5. **Gate gaming.** `GATE_SKIP`, lint or type suppressions without a reason, new `exclude`
    patterns or other edits under `.ub/`, hand edits of `.metrics/`, mutants called "equivalent"
-   that are not, debt that grew while the summary calls it old.
+   that are not, debt that grew while the summary calls it old, an agreed acceptance example
+   changed to make it pass.
 6. **Critical code.** Money, security, anything lives depend on: read those functions line by
    line — metrics do not see a wrong formula or a missing check. Name them in your answer.
 

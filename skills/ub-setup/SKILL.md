@@ -79,6 +79,18 @@ changing and why before each one.
 * Existing violations are architecture debt: list them for the owner; do not hide them with
   `:omit`.
 
+## 5a. Acceptance tests
+* Ask the owner how behaviour is agreed: an existing acceptance suite (Gherkin, FitNesse,
+  Martin's AgNesse for agents, Playwright end-to-end, …) or checks by hand.
+* If a suite exists, set `[ub] acceptance` to the command that runs it, from the repo root.
+  Do not add a framework without the owner; empty means the owner checks by hand, and the
+  gate says so in its summary.
+
+## 5b. Concern audits
+* `.ub/audits/*.md` are the checklists of `just audit <concern>` (architecture, coverage,
+  concurrency, security, api). Adapt them to what the project's docs already say (its
+  security model, its API contract); add a concern file if the project has one more.
+
 ## 6. Ratchet mode (an existing project)
 * Run `just ub-baseline`. It scores every function and counts duplicate groups; show the owner
   `.ub/baseline/summary.txt`. The owner decides whether to commit it as the starting line.

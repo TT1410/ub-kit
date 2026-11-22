@@ -1,13 +1,17 @@
 # ub-kit: one disciplined agent per task, checked by Robert C. Martin's tools.
 # Imported by the project's justfile; settings in .ub/config, logs in .ub/out.
 
-# The task's gate for what changed since base (default: merge-base with the main branch): verify, CRAP, DRY, mutation, Dependency Rule; GATE_SKIP=verify,crap,dry,mutation,structure skips stages
+# The task's gate for what changed since base (default: merge-base with the main branch): verify, acceptance, CRAP, DRY, mutation, Dependency Rule; GATE_SKIP=verify,acceptance,crap,dry,mutation,structure skips stages
 gate base="":
     python3 "{{source_directory()}}/ub" gate {{quote(base)}}
 
 # Another model reviews the task's diff, read-only (grok, then codex); exit 2 = nobody answered, the task is not reviewed
 review base="" card="":
     python3 "{{source_directory()}}/ub" review {{quote(base)}} {{quote(card)}}
+
+# Another model audits one concern — architecture, coverage, concurrency, security, api (.ub/audits/) — of the whole project, or of what changed since base
+audit concern base="":
+    python3 "{{source_directory()}}/ub" audit {{quote(concern)}} {{quote(base)}}
 
 # uml-viewer: modules, dependencies, Dependency Rule violations, CRAP and mutation colours; action: open, install, metrics, ir
 uml action="open":

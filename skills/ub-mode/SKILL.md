@@ -119,6 +119,13 @@ owner has tried the behaviour by hand.
 * `just gate` runs dryer (threshold 0.8).
 * Eliminate duplication that touches the code you changed.
 
+## Saturation, not ceremony
+* crapper and mutator push the tests until every expression is covered by a test that fails
+  when the expression changes (Martin, 6 Nov 2026). That keeps the code stable under change; it
+  does not prove the system right — acceptance tests and the owner do that.
+* A test must check behaviour someone relies on. No tests of import order, of private
+  details, or that a removed feature is absent: delete the feature's tests with it.
+
 ## Mutator
 * `just gate` runs mutator on the changed files, and on the code whose tests you changed.
 * Cover the uncovered.
@@ -159,6 +166,23 @@ owner has tried the behaviour by hand.
   skipped or stubbed, which tests are missing, which `GATE_SKIP` you used and why.
 * Put it at the top of the report under «Не зроблено». An empty list must be earned.
 
+## Acceptance tests
+* When `[ub] acceptance` is set, the gate runs the acceptance tests the owner agreed. A new
+  behaviour gets its acceptance example written with the owner before the code; never change
+  an agreed example to make it pass — ask.
+
+## Concern passes
+* Before a release, or when the owner asks, run one pass per concern: `just audit
+  architecture`, `coverage`, `concurrency`, `security`, `api`. Another model interrogates the
+  verification of that concern, not every line (Martin, 8 Nov 2026).
+* Answer every finding with a test or a check that settles it. For concurrency, a jitter test:
+  random delays at the critical points, the suite run many times.
+
+## Interrogate, then fix
+* When the owner reports a symptom, answer questions about it before changing code: what the
+  code does there, which test covers it, what you assumed.
+* Fix a bug with a test that fails because of it, then make that test pass.
+
 ## Read the Critical Code
 * Money, security (sessions, passwords, permissions) and anything lives depend on are not
   accepted on metrics alone.
@@ -180,5 +204,10 @@ owner has tried the behaviour by hand.
 
 ## Commit and Push
 * Commit often, in small ordered commits, with the `.metrics/mutate/` snapshots the gate wrote.
-* Each commit says why, what changed, and how you proved it.
+* Each commit message has three parts, as Martin's own commits do:
+  * `Why:` the problem, as the user or the code saw it;
+  * `What:` the change;
+  * `Proof:` the tests that failed first and pass now, and the gate's numbers — crapper's
+    highest CRAP on the changed code, dryer's candidates, mutator's killed/survived on the
+    changed lines.
 * Push to the main line at the end, when the owner agrees.

@@ -29,7 +29,8 @@ SKILLS = ["ub-mode", "ub-setup"]
 SKIP_DIRS = {"node_modules", "vendor", "dist", "build", "target", "venv", "testdata", "e2e"}
 EXT = {"python": (".py",), "go": (".go",), "typescript": (".ts", ".tsx")}
 TEST_RE = re.compile(r"(^|/)(tests?|__tests__|testdata)/|(^|/)test_[^/]*\.py$|_test\.(py|go)$|\.(test|spec)\.tsx?$|\.d\.ts$")
-OUR_RECIPES = {"gate", "review", "uml", "ub-baseline", "ub-doctor", "ub-tools"}
+OUR_RECIPES = {"gate", "review", "audit", "uml", "ub-baseline", "ub-doctor", "ub-tools"}
+AUDITS = ["architecture", "coverage", "concurrency", "security", "api"]
 BEGIN, END = "<!-- ub-kit:start", "<!-- ub-kit:end -->"
 
 
@@ -234,6 +235,9 @@ main = {main}
 mode = {mode}
 # The check every change passes, from the repo root: lint, types, module boundaries, tests.
 {todo_verify}verify = {verify}
+# Acceptance tests the owner agreed (AgNesse, FitNesse, Gherkin, …), from the repo root; empty:
+# the owner checks the behaviour by hand. Unit tests keep the code stable; these show it is right.
+acceptance =
 crap_max = 10
 dry_threshold = 0.8
 # Regex of repo paths the gate does not judge (generated code without a "do not edit" header).
@@ -284,8 +288,9 @@ def render_policy(repo: Path, langs: dict) -> str:
             todo = "TODO(ub-setup): check :src and :prefix (the package root)"
     elif lang == "go":
         m = re.search(r"^module\s+(\S+)", (root / "go.mod").read_text(), re.M)
-        module = m[1] if m else ""
-        prefix = ".".join(p for p in (module.replace("/", "."), info["src"].replace("/", ".")) if p)
+        # Martin's Go scanner: package directories under :src are the ids (internal/x -> x when
+        # :src is internal/); :prefix only names the root package.
+        prefix = (m[1].rsplit("/", 1)[-1] if m else root.name)
     else:
         prefix = re.sub(r"^@[^/]+/", "", package_json(root).get("name", "")) or root.name
         todo = "TODO(ub-setup): check :prefix — run `just uml ir` and look at the ids"
@@ -485,6 +490,9 @@ def install(repo: Path, args) -> None:
         plan.write(f".ub/{f}", (KIT / "kit" / f).read_text(), "kit")
     plan.write(".ub/VERSION", VERSION + "\n", "kit version")
     plan.once(".ub/review.md", (KIT / "kit" / "defaults" / "review.md").read_text(), "the reviewer's prompt")
+    for concern in AUDITS:
+        plan.once(f".ub/audits/{concern}.md", (KIT / "kit" / "defaults" / "audits" / f"{concern}.md").read_text(),
+                  f"checklist of `audit {concern}`")
     for skill in SKILLS:
         plan.write(f".claude/skills/{skill}/SKILL.md", (KIT / "skills" / skill / "SKILL.md").read_text(), "skill")
     ci = args.ci or (repo / ".github" / "workflows" / "ub-gate.yml").exists()

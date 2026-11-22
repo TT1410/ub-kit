@@ -7,13 +7,16 @@ Run from the repository; the justfile wraps every command:
                             Exit 0 green, 1 red, 2 cannot run.
   review [BASE] [CARD]      another model reviews the diff, read-only. Exit 0 PASS, 1 CHANGES,
                             2 no model answered (the task is not reviewed).
+  audit CONCERN [BASE]      another model audits one concern (architecture, coverage,
+                            concurrency, security, api — .ub/audits/) of the project or of
+                            what changed since BASE; exits like review.
   baseline                  ratchet mode: record today's CRAP debt; only new debt is red
   doctor                    check the tools and the configuration, list what is left to do
   uml [open|install|metrics|ir]                  uml-viewer: modules, dependencies, Dependency Rule
   tools [install|crapper|mutator|dryer ARGS...]  Martin's tools at pinned commits
 
 Settings: .ub/config. Logs: .ub/out/. Needs git and Python >= 3.9; the tools need >= 3.11.
-GATE_SKIP=verify,crap,dry,mutation,structure skips gate stages (the reviewer sees it).
+GATE_SKIP=verify,acceptance,crap,dry,mutation,structure skips gate stages (the reviewer sees it).
 """
 from __future__ import annotations
 
@@ -42,9 +45,10 @@ BASELINE = UB / "baseline" / "crap.tsv"
 POLICY = UB / "uml" / "policy.edn"
 DIAGRAM = UB / "uml" / "project.edn"
 # name -> commit. Bump deliberately, after reading the tool's log.
-PINS = {"crapper": "6fd92c4", "mutator": "a5a0cb8", "dryer": "66ff6d2"}
-UML_REPO = os.environ.get("UB_UML_REPO", "https://github.com/TT1410/uml-viewer.git")
-UML_REF = os.environ.get("UB_UML_REF", "2390b33")
+PINS = {"crapper": "c757ec7", "mutator": "29afb42", "dryer": "66ff6d2"}
+# Martin's own uml-viewer reads Go since 10 Nov 2026; the TT1410 fork is no longer needed.
+UML_REPO = os.environ.get("UB_UML_REPO", "https://github.com/unclebob/uml-viewer.git")
+UML_REF = os.environ.get("UB_UML_REF", "ad6c36d")
 QUIL = "4.3.1563"
 _cache_home = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
 CACHE = Path(os.environ.get("UB_CACHE") or _cache_home / "ub-kit")
@@ -126,6 +130,7 @@ class Config:
     reviewers: list
     review_turns: str
     langs: list
+    acceptance: str = ""
 
 
 def load_config() -> Config:
@@ -155,6 +160,7 @@ def load_config() -> Config:
         reviewers=(os.environ.get("REVIEWER", "") + " " + ub.get("reviewers", "grok codex")).split(),
         review_turns=ub.get("review_turns", "30").strip(),
         langs=langs,
+        acceptance=ub.get("acceptance", "").strip(),
     )
 
 
@@ -695,6 +701,17 @@ class Gate:
                 rc, _ = run(cfg.verify, ROOT, self.log("verify.log"), shell=True)
                 if rc:
                     self.fail(f"verify failed: {cfg.verify} (.ub/out/gate/verify.log)")
+        # Unit tests saturated by crapper and mutator keep the code stable; they do not prove
+        # the system does what the customer wants. Acceptance tests the owner agreed (AgNesse,
+        # FitNesse, Gherkin, …) do that part, when the project has them (Martin, 6 and 14 Nov 2026).
+        if cfg.acceptance:
+            if not self.skipped("acceptance"):
+                self.stage("acceptance")
+                rc, _ = run(cfg.acceptance, ROOT, self.log("acceptance.log"), shell=True)
+                if rc:
+                    self.fail(f"acceptance tests failed: {cfg.acceptance} (.ub/out/gate/acceptance.log)")
+        else:
+            self.note("NOTE", "no acceptance tests ([ub] acceptance): the owner checks the behaviour by hand")
         for lang in cfg.langs:
             self.language(lang)
         self.structure()
@@ -978,25 +995,69 @@ def cmd_review(args: list) -> int:
         print(f"review: no base commit (merge-base with {cfg.main}?)")
         return 2
     card = args[1] if len(args) > 1 else ""
-    d = OUT / "review"
+    return ask_reviewers(cfg, review_prompt(base, card), OUT / "review", "review")
+
+
+def ask_reviewers(cfg: Config, text: str, d: Path, label: str) -> int:
+    """Give the prompt to the reviewers in order until one answers with a verdict: exit 0 PASS,
+    1 CHANGES, 2 nobody answered."""
     d.mkdir(parents=True, exist_ok=True)
     prompt, answer, err = d / "prompt.md", d / "answer.md", d / "error.log"
-    prompt.write_text(review_prompt(base, card), encoding="utf-8")
-    print(f"review: prompt {prompt.stat().st_size} bytes, reviewers in order: {' '.join(dict.fromkeys(cfg.reviewers))}")
+    prompt.write_text(text, encoding="utf-8")
+    print(f"{label}: prompt {prompt.stat().st_size} bytes, reviewers in order: {' '.join(dict.fromkeys(cfg.reviewers))}")
     # Usage limits are the norm (Martin moved between Grok and Codex for weeks): when one model
     # fails, the next one reviews.
     err.write_text("")
     for name in dict.fromkeys(cfg.reviewers):
-        print(f"review: asking {name}…", flush=True)
+        print(f"{label}: asking {name}…", flush=True)
         why = run_reviewer(name, prompt, answer, err, cfg.review_turns)
         if not why:
-            text = answer.read_text(errors="replace")
-            verdict = VERDICT_RE.match(text)
-            print(f"review by {name} (.ub/out/review/answer.md):\n\n{text.strip()}\n")
+            out = answer.read_text(errors="replace")
+            verdict = VERDICT_RE.match(out)
+            print(f"{label} by {name} ({rel(answer)}):\n\n{out.strip()}\n")
             return 0 if verdict[1] == "PASS" else 1
-        print(f"review: {name} did not review it — {why}")
-    print("review: no model answered — the task is NOT reviewed; tell the owner (.ub/out/review/error.log)")
+        print(f"{label}: {name} did not answer — {why}")
+    print(f"{label}: no model answered — NOT done; tell the owner ({rel(err)})")
     return 2
+
+
+AUDITS = UB / "audits"
+AUDIT_HEAD = """# Audit pass by another model (ub-kit): {concern}
+
+You are auditing one concern of a system that AI agents wrote. You are read-only: do not edit,
+create or delete files; run only commands that change nothing (tests, the project's own read-only
+tools). Never open or quote `.env*`, database dumps, `.ub/out/`, or real people's data.
+
+Robert C. Martin's way (8 Nov 2026): one pass per concern, judged by interrogating the system
+and reviewing its verification procedures — the tests, the checks, the tools that prove the
+concern holds — not by reading every line. Read code where a verification is missing or weak,
+and name it.
+
+Start your answer with one line: `VERDICT: PASS` (the concern is verified well enough to ship)
+or `VERDICT: CHANGES`. Then, most severe first: `[blocker|major|minor] path:line — what is wrong
+or unverified, and the test or check that would settle it`. End with «Not verified»: what you
+could not establish. Keep it under 80 lines.
+"""
+
+
+def cmd_audit(args: list) -> int:
+    """One concern pass over the project (or over what changed since BASE)."""
+    known = sorted(p.stem for p in AUDITS.glob("*.md")) if AUDITS.is_dir() else []
+    if not args or args[0] not in known:
+        raise UbError(f"usage: ub audit CONCERN [BASE] — concerns: {', '.join(known) or 'none in .ub/audits/'}")
+    cfg, concern = load_config(), args[0]
+    parts = [AUDIT_HEAD.format(concern=concern), (AUDITS / f"{concern}.md").read_text(encoding="utf-8"), ""]
+    if len(args) > 1 and args[1]:
+        if not ref_exists(args[1]):
+            raise UbError(f"no commit {args[1]}")
+        files = collect_change(args[1]).files
+        parts += [f"## Scope: what changed since {args[1]}", *[f"- {f}" for f in files], ""]
+    else:
+        parts += ["## Scope: the whole project", ""]
+    summary = OUT / "gate" / "summary.txt"
+    if summary.exists():
+        parts += ["## Last gate summary", summary.read_text(encoding="utf-8")]
+    return ask_reviewers(cfg, "\n".join(parts) + "\n", OUT / "audit" / concern, f"audit {concern}")
 
 
 # ---------------------------------------------------------------- baseline, doctor
@@ -1187,18 +1248,13 @@ def cmd_uml(args: list) -> int:
 
 
 def cmd_go_cover(args: list) -> int:
-    """Go coverage of these packages into target/coverage/go/coverage.out. The profile names
-    files by import path; mutator matches them to files by path suffix, so the module path is
-    replaced by the module's directory name (finteam/internal/x.go -> backend/internal/x.go)."""
+    """Go coverage of only these packages into target/coverage/go/coverage.out, where crapper
+    and mutator read it. The profile names files by import path; crapper c757ec7 and mutator
+    29afb42 resolve that through go.mod, so a module named unlike its directory needs no help."""
     root, pkgs = Path(args[0]), args[1:] or ["./..."]
     profile = root / "target" / "coverage" / "go" / "coverage.out"
     profile.parent.mkdir(parents=True, exist_ok=True)
-    rc = subprocess.call(["go", "test", "-count=1", f"-coverprofile={profile}", *pkgs], cwd=root)
-    m = re.search(r"^module\s+(\S+)", (root / "go.mod").read_text(), re.M)
-    if profile.exists() and m:
-        text = re.sub(rf"^{re.escape(m[1])}/", f"{root.resolve().name}/", profile.read_text(), flags=re.M)
-        profile.write_text(text)
-    return rc
+    return subprocess.call(["go", "test", "-count=1", f"-coverprofile={profile}", *pkgs], cwd=root)
 
 
 def cmd_ts_cover(args: list) -> int:
@@ -1232,6 +1288,8 @@ def main(argv: list) -> int:
             return Gate(cfg, base).run()
         if cmd == "review":
             return cmd_review(args)
+        if cmd == "audit":
+            return cmd_audit(args)
         if cmd == "baseline":
             return cmd_baseline()
         if cmd == "doctor":

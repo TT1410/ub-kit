@@ -22,6 +22,7 @@ expect() {
   if [[ $got == "$want" ]]; then ok "$what (exit $got)"; else bad "$what: exit $got, want $want (log: $work/last.log)"; tail -20 "$work/last.log"; fi
 }
 has() { if grep -q -- "$2" "$1"; then ok "$3"; else bad "$3: no «$2» in $1"; fi; }
+has_not() { if grep -q -- "$2" "$1"; then bad "$3: «$2» in $1"; else ok "$3"; fi; }
 commit() { git add -A && git commit -qm "$1"; }
 
 python_case() {
@@ -177,6 +178,36 @@ func TestGross(t *testing.T) {
 }
 EOF
   expect 0 "proper tests make it green" -- just gate
+
+  say "go: Martin's uml-viewer draws the packages and marks a broken Dependency Rule"
+  if command -v clojure >/dev/null || [[ -x "$HOME/.local/bin/clojure" ]]; then
+    mkdir -p backend/internal/web
+    printf 'package web\n\nimport "acme/internal/pricing"\n\n// Show prints a net price.\nfunc Show() int { return pricing.Net(100, 10) }\n' >backend/internal/web/web.go
+    sed -i.bak 's#^ :foreign \[\]}# :foreign []\n :levels [[pricing] [web]]}#' .ub/uml/policy.edn && rm -f .ub/uml/policy.edn.bak
+    expect 0 "uml ir builds the Go diagram" -- just uml ir
+    has_not .ub/uml/project.edn ":violating true" "web -> pricing keeps the rule (pricing is inner)"
+    has .ub/uml/project.edn ":pricing" "the pricing package is on the diagram"
+    has .ub/uml/project.edn ":web" "the web package is on the diagram"
+    sed -i.bak 's#:levels \[\[pricing\] \[web\]\]#:levels [[web] [pricing]]#' .ub/uml/policy.edn && rm -f .ub/uml/policy.edn.bak
+    expect 0 "uml ir with the levels reversed" -- just uml ir
+    has .ub/uml/project.edn ":violating true" "web -> pricing now breaks the Dependency Rule"
+    expect 1 "and the gate's structure stage is red on it" -- just gate
+    has .ub/out/gate/summary.txt "break the Dependency Rule" "it names the rule"
+    sed -i.bak 's#:levels \[\[web\] \[pricing\]\]#:levels [[pricing] [web]]#' .ub/uml/policy.edn && rm -f .ub/uml/policy.edn.bak
+  else
+    echo "  skip (no Clojure CLI)"
+  fi
+
+  say "go: acceptance tests and concern audits"
+  sed -i.bak 's#^acceptance =.*#acceptance = echo "the agreed example fails" \&\& exit 1#' .ub/config && rm -f .ub/config.bak
+  expect 1 "a failing acceptance suite makes the gate red" -- just gate
+  has .ub/out/gate/summary.txt "acceptance tests failed" "it says so"
+  sed -i.bak 's#^acceptance =.*#acceptance = true#' .ub/config && rm -f .ub/config.bak
+  expect 0 "a passing one keeps it green" -- just gate
+  expect 2 "an unknown concern is refused" -- just audit nonsense
+  sed -i.bak 's#^reviewers =.*#reviewers = no-such-reviewer#' .ub/config && rm -f .ub/config.bak
+  expect 2 "audit with no reviewer is not done (exit 2)" -- just audit security
+  has .ub/out/audit/security/prompt.md "Concern: security" "the security checklist is in the prompt"
 }
 
 typescript_case() {
