@@ -1378,7 +1378,16 @@ def cmd_ts_cover(args: list) -> int:
             print(f"no spec beside {' '.join(files)}: no coverage", file=sys.stderr)
             return 0
         cmd += [f"--coverage.include={f}" for f in files] + specs
-    return subprocess.call(cmd, cwd=root)
+    else:
+        # The whole suite: in vmThreads or threads pools a worker's heap runs out under coverage
+        # on a large frontend (fin-team, 1,790 spec files); child processes do not.
+        cmd += ["--pool=forks"]
+    # v8 coverage of a whole suite is merged in one Node process: a large frontend runs out of
+    # Node's default heap (seen on a 3,000-spec project). Give it room unless the project chose.
+    env = dict(os.environ)
+    if "max-old-space-size" not in env.get("NODE_OPTIONS", ""):
+        env["NODE_OPTIONS"] = (env.get("NODE_OPTIONS", "") + " --max-old-space-size=8192").strip()
+    return subprocess.call(cmd, cwd=root, env=env)
 
 
 # ---------------------------------------------------------------- entry
