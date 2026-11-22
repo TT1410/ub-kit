@@ -28,24 +28,24 @@ check and integrate. Ordinary tasks do not need this: one agent under ub-mode is
 * One unit, one subagent, one git worktree on its own branch from the integration branch
   (Claude Code: an Agent with worktree isolation). Its brief: the unit, its acceptance
   example, the files it may touch, "work under ub-mode (read `.claude/skills/ub-mode/`), end
-  with a green `just gate <integration branch>` and report its summary and your log".
+  with a green `.ub/ub gate <integration branch>` and report its summary and your log".
 * Race a unit when it is risky or the first attempt was weak: two subagents, the same brief,
   separate worktrees. Keep the one whose gate is green with fewer changed lines, lower CRAP and
   no DEBT added; discard the other.
 
 ## 3. Check — the fence posts
 For each returned unit, before it is integrated:
-* Run `just gate` in its worktree yourself. A subagent's "green" is a claim, not a result.
+* Run `.ub/ub gate` in its worktree yourself. A subagent's "green" is a claim, not a result.
 * Read its diff against the unit: no work outside it, no edits under `.ub/`, `.metrics/`, the
   skills or the boundary rules, no weakened or ceremony tests, acceptance examples unchanged.
-* Run `just review` there. Any CHANGES, a red gate or a failed check: send the unit back to a
+* Run `.ub/ub review` there. Any CHANGES, a red gate or a failed check: send the unit back to a
   subagent with the findings, verbatim. Two failed rounds on one unit: stop and ask the owner.
 
 ## 4. Integrate
 * Merge units into the integration branch one at a time, in plan order; after each merge run
-  `just gate` on the integration branch. A red gate after a merge is your problem to send back,
+  `.ub/ub gate` on the integration branch. A red gate after a merge is your problem to send back,
   not to patch.
-* When all units are in: the concern passes that apply (`just audit …`), then a report to the
+* When all units are in: the concern passes that apply (`.ub/ub audit …`), then a report to the
   owner: units, their gate numbers and review verdicts, what was sent back and why, and
   «Не зроблено».
 * Remove the worktrees you created. Push nothing; the owner merges to the main line.

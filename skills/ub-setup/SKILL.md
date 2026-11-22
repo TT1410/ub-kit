@@ -3,7 +3,7 @@ name: ub-setup
 description: >
   Finish setting up ub-kit (.ub/) in this repository with the owner: the stack of a new project,
   the verify command, module boundaries, the diagram's layers, the ratchet baseline, the
-  reviewer — until `just ub-doctor` is clean and `just gate` runs end to end. Use once after
+  reviewer — until `.ub/ub doctor` is clean and `.ub/ub gate` runs end to end. Use once after
   install.sh, when the user runs /ub-setup, or when ub-doctor reports problems.
 ---
 # ub-setup
@@ -16,7 +16,7 @@ Edits under `.ub/`, `.claude/skills/` and `.metrics/` ask the owner by design �
 changing and why before each one.
 
 ## 0. Look first — the project's own rules come first
-* Run `just ub-doctor` (or `python3 .ub/ub doctor`) and read `.ub/config`.
+* Run `.ub/ub doctor` (or `python3 .ub/ub doctor`) and read `.ub/config`.
 * Read what the project already says about itself: `AGENTS.md`, `CLAUDE.md` (outside the
   ub-kit block), `.cursor/rules`, `.github/copilot-instructions.md`, `CONTRIBUTING.md`,
   `ARCHITECTURE.md`, `docs/adr/`, `docs/architecture*`, the README; then the build files, the CI
@@ -47,7 +47,8 @@ changing and why before each one.
 ## 2. verify
 * `[ub] verify` is the check every change passes: lint, types, module boundaries, tests — with
   the project's own commands, from the repo root. Prefer an existing `just verify`, `make check`
-  or package script; otherwise write a `verify` recipe in the justfile and point verify at it.
+  or package script; otherwise put the chain itself in `verify` (one line, joined with &&). Do
+  not add a task runner the project does not use.
 * Run it. It must pass on the main branch before the gate means anything; if it does not, tell
   the owner and stop here.
 
@@ -60,7 +61,7 @@ changing and why before each one.
 * Write the layers the owner named, not a textbook set.
 
 ## 4. Language details
-* Python: `just ub-doctor` must show no editable install. If `crapper` cannot find pytest or
+* Python: `.ub/ub doctor` must show no editable install. If `crapper` cannot find pytest or
   coverage, add them, or set `[python] test` / `coverage`.
 * Go: if a package's code is tested from elsewhere (a module tested as a whole), set
   `[go] tree` to a regex whose group 1 is that directory. If tests need a database or other
@@ -74,7 +75,7 @@ changing and why before each one.
 ## 5. The diagram (`.ub/uml/policy.edn`)
 * Set `:levels` to the layers the project's docs or boundary config already define (ask the
   owner only when nothing is written or the code disagrees with the docs), inner first, and fix `:src` / `:prefix` if the TODO
-  says so. Run `just uml ir`; the summary line counts violating edges. Needs Java 21 and the
+  says so. Run `.ub/ub uml ir`; the summary line counts violating edges. Needs Java 21 and the
   Clojure CLI; without them the gate skips this stage and says so — tell the owner.
 * Existing violations are architecture debt: list them for the owner; do not hide them with
   `:omit`.
@@ -87,25 +88,25 @@ changing and why before each one.
   gate says so in its summary.
 
 ## 5b. Concern audits
-* `.ub/audits/*.md` are the checklists of `just audit <concern>` (architecture, coverage,
+* `.ub/audits/*.md` are the checklists of `.ub/ub audit <concern>` (architecture, coverage,
   concurrency, security, api). Adapt them to what the project's docs already say (its
   security model, its API contract); add a concern file if the project has one more.
 
 ## 6. Ratchet mode (an existing project)
-* Run `just ub-baseline`. It scores every function and counts duplicate groups; show the owner
+* Run `.ub/ub baseline`. It scores every function and counts duplicate groups; show the owner
   `.ub/baseline/summary.txt`. The owner decides whether to commit it as the starting line.
 * Mutation needs no baseline: in ratchet mode the gate mutates only the changed lines.
 
 ## 7. Prove it runs
-* On a scratch branch, make a tiny real change with its test and run `just gate`. It must run
+* On a scratch branch, make a tiny real change with its test and run `.ub/ub gate`. It must run
   every stage to a verdict; a red verdict on real problems is fine, a crash or a skipped stage
   is not. Throw the scratch branch away.
-* Run `just review` once. If it exits 2, tell the owner which reviewer needs a login or credits
+* Run `.ub/ub review` once. If it exits 2, tell the owner which reviewer needs a login or credits
   (`grok`, `codex login`); the order is `[ub] reviewers`.
 
 ## 8. Record it
 * If the project keeps ADRs, write one: one disciplined agent per task (ub-mode), the gate and
   its thresholds, the mode and why, the reviewer, what the owner still checks by hand.
-* Commit on the branch: `.ub/`, `.claude/`, the justfile, `.gitignore`, `AGENTS.md`/`CLAUDE.md`,
+* Commit on the branch: `.ub/`, `.claude/`, the justfile if the installer touched it, `.gitignore`, `AGENTS.md`/`CLAUDE.md`,
   the boundary config, the baseline if approved. Report what is done, and under «Не зроблено»
   what is not (for example: no Java, so no structure stage; reviewer without credits).

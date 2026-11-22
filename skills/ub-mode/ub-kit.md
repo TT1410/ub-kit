@@ -4,13 +4,13 @@
 this page is about tools, his text about the work. The project's own rules and architecture
 (`AGENTS.md`, `CLAUDE.md`, ADRs, architecture docs) come first; when they disagree with
 ub-mode, ask the owner. The block ub-kit manages in AGENTS.md / CLAUDE.md names the commands
-(`just gate`, or `just ub gate` when the project's justfile already had those names).
+(`.ub/ub gate`; in a project that imports `.ub/ub.just`, `just gate` or `just ub gate` is the same).
 
 ## Done means
-* `just gate` is green: verify, the acceptance tests if `[ub] acceptance` is set, crapper,
+* `.ub/ub gate` is green: verify, the acceptance tests if `[ub] acceptance` is set, crapper,
   dryer and mutator on what changed since the merge-base, the Dependency Rule on the diagram.
   That is "Use the crapper / dryer / mutator tool". Logs: `.ub/out/gate/`.
-* Every finding of `just review` (another model, read-only) is answered: fixed, or why it is
+* Every finding of `.ub/ub review` (another model, read-only) is answered: fixed, or why it is
   wrong. Exit 2 means nobody reviewed it — say so, do not merge. Two rounds of disagreement:
   ask the owner.
 * The owner has tried the behaviour. The log is `docs/log/<task>.md` (or where the project's
@@ -33,9 +33,9 @@ ub-mode, ask the owner. The block ub-kit manages in AGENTS.md / CLAUDE.md names 
   lower than you found it when that is cheap and safe, never higher, and say which in the log.
 
 ## Concern passes
-* Before a release, or when the owner asks: `just audit architecture | coverage | concurrency
+* Before a release, or when the owner asks: `.ub/ub audit architecture | coverage | concurrency
   | security | api`, and answer each finding with a test or a check. For a race: random delays
-  at the critical points, then `just soak 50` (the suite fifty times).
+  at the critical points, then `.ub/ub soak 50` (the suite fifty times).
 
 ## Never game the gate
 * `.ub/`, `.metrics/`, the skills, the boundary rules and the baseline are the owner's: editing

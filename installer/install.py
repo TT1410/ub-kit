@@ -2,11 +2,13 @@
 """Install ub-kit into a repository, new or existing, or upgrade it there.
 
   install.sh [REPO] [--langs python,go,typescript] [--mode strict|ratchet] [--main BRANCH]
-             [--ci] [--upgrade] [--dry-run]
+             [--ci] [--no-just] [--upgrade] [--dry-run]
 
 REPO defaults to the current directory; a missing directory becomes a new git repository.
 Languages, their roots, the main branch, the verify command and the mode are detected; what
 cannot be detected is marked TODO(ub-setup) in .ub/config for the ub-setup skill.
+The commands are `.ub/ub gate|review|audit|…` (Python only). A project that already has a
+justfile also gets `import '.ub/ub.just'` (just gate, …) unless --no-just; none is created.
 --upgrade rewrites only the kit's own files (.ub/ub, ub.just, snippets, skills, managed blocks)
 and keeps .ub/config, .ub/review.md, .ub/uml/policy.edn and .ub/baseline/.
 """
@@ -231,7 +233,7 @@ main = {main}
 # strict:  everything in a changed file must be clean (new projects).
 # ratchet: only new debt is red — mutants and duplicates on the changed lines, functions at
 #          CRAP >= crap_max that are not in .ub/baseline/crap.tsv or got worse; old debt in
-#          touched files is listed as DEBT (existing projects; run `just ub-baseline` once).
+#          touched files is listed as DEBT (existing projects; run `.ub/ub baseline` once).
 mode = {mode}
 # The check every change passes, from the repo root: lint, types, module boundaries, tests.
 {todo_verify}verify = {verify}
@@ -296,8 +298,8 @@ def render_policy(repo: Path, langs: dict) -> str:
         prefix = (m[1].rsplit("/", 1)[-1] if m else root.name)
     else:
         prefix = re.sub(r"^@[^/]+/", "", package_json(root).get("name", "")) or root.name
-        todo = "TODO(ub-setup): check :prefix — run `just uml ir` and look at the ids"
-    return f""";; uml-viewer policy (ub-kit). `just uml` regenerates .ub/uml/project.edn from it and opens the
+        todo = "TODO(ub-setup): check :prefix — run `.ub/ub uml ir` and look at the ids"
+    return f""";; uml-viewer policy (ub-kit). `.ub/ub uml` regenerates .ub/uml/project.edn from it and opens the
 ;; viewer; the gate's structure stage counts the edges marked :violating. Edits ask the owner.
 ;; :levels — the Dependency Rule by the first segment after :prefix, inner (higher-level) first;
 ;; an edge from an inner segment to an outer one is a violation.
@@ -318,6 +320,7 @@ def render_block(mode: str, main: str, j: str) -> str:
         "strict": "everything in a changed file must be clean.",
         "ratchet": "only new debt is red; `DEBT:` lines in the summary are old debt you touched — leave it lower than you found it, never higher.",
     }
+    just = f" The same through just: `{j}gate`, `{j}review`, `{j}audit`, …" if j else ""
     return f"""{BEGIN} — managed by ub-kit (install.sh --upgrade rewrites it); keep your own rules outside -->
 ## How tasks are worked here
 
@@ -325,14 +328,17 @@ One task, one agent, the `ub-mode` skill — Robert C. Martin's text in
 `.claude/skills/ub-mode/SKILL.md` and how it runs here in `ub-kit.md` beside it (agents without
 skills: read both before the first change). A large task the owner wants delegated: the
 `ub-lead` skill. A task is done when:
-- `{j}gate` is green: verify, acceptance tests if set, CRAP < 10, no duplication (dryer 0.8),
+- `.ub/ub gate` is green: verify, acceptance tests if set, CRAP < 10, no duplication (dryer 0.8),
   no surviving or uncovered mutants, the Dependency Rule — for what changed since the
   merge-base with `{main}`.
   Mode {mode}: {modes[mode]}
-- every finding of `{j}review` (another model, read-only) is answered; exit 2 means nobody
+- every finding of `.ub/ub review` (another model, read-only) is answered; exit 2 means nobody
   reviewed it — say so, do not merge;
 - the owner has tried the behaviour, and the task's log (`docs/log/<task>.md`, or where the
   project's rules keep logs) starts with «Не зроблено».
+
+Commands: `.ub/ub gate | review | audit | soak | uml | doctor | baseline` from the repo root
+(Windows: `py .ub\\ub gate`).{just}
 
 `.ub/`, `.metrics/` and the skills are guarded: never edit them to get past the gate; ask.
 Ask when a requirement is ambiguous. Commit in small steps; push only on the owner's word.
@@ -347,10 +353,11 @@ def with_block(text: str, block: str) -> str:
     return (text.rstrip("\n") + "\n\n" if text.strip() else "") + block
 
 
-def render_ci(repo: Path, main: str, langs: dict) -> str:
+def render_ci(repo: Path, main: str, langs: dict, verify: str = "") -> str:
     steps = ["      - uses: actions/checkout@v4\n        with:\n          fetch-depth: 0",
-             "      - uses: actions/setup-python@v5\n        with:\n          python-version: \"3.12\"",
-             "      - uses: extractions/setup-just@v3"]
+             "      - uses: actions/setup-python@v5\n        with:\n          python-version: \"3.12\""]
+    if re.search(r"(^|[\s;&|(])just\s", verify):
+        steps.append("      - uses: extractions/setup-just@v3")  # the project's own verify runs through just
     for lang, info in langs.items():
         root = repo / info["rel"] if info["rel"] else repo
         wd = f"\n        working-directory: {info['rel']}" if info["rel"] else ""
@@ -404,16 +411,17 @@ def merged_settings(text: str, rules: list) -> str:
     return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
 
-def wire_justfile(plan: Plan, verify: str) -> str:
-    """Import the kit's recipes; returns how to call them ('just ' or 'just ub ')."""
+def wire_justfile(plan: Plan, no_just: bool) -> str:
+    """Optional short names for projects that already use just: imports the kit's recipes into
+    their justfile; returns the prefix ('just ' or 'just ub '), or '' when there is none."""
     jf = justfile(plan.repo)
     if jf is None:
-        if plan.dry:
-            return "just "
-        sys.exit("install: no justfile to wire (it is written with the config)")
+        return ""
     text = plan.read(jf.name) if not plan.dry else jf.read_text(errors="ignore")
     if ".ub/ub.just" in text:
         return "just ub " if re.search(r"^mod\s+ub\b", text, re.M) else "just "
+    if no_just:
+        return ""
     names = set(re.findall(r"^@?([A-Za-z_][\w-]*)\b[^\n:=]*:(?!=)", text, re.M))
     names |= set(re.findall(r"^alias\s+([\w-]+)", text, re.M))
     clash = sorted(names & OUR_RECIPES)
@@ -481,14 +489,6 @@ def install(repo: Path, args) -> None:
         mode = args.mode or ("ratchet" if files > 15 else "strict")
         verify, sure = guess_verify(repo, langs)
         how = "--mode" if args.mode else f"{files} product files already here"
-        if justfile(repo) is None:
-            # verify lives in one place: the new justfile's recipe, which .ub/config calls.
-            plan.write("justfile", "# Project tasks; `just --list` shows them.\n\nimport '.ub/ub.just'\n\n"
-                       + ("" if sure else "# TODO(ub-setup): a guess — make it lint, types, module boundaries and the tests.\n"
-                          if verify else "# TODO(ub-setup): no stack yet — its lint, types, module boundaries and tests go here.\n")
-                       + "# Lint, types, module boundaries, tests: the check every change passes\nverify:\n    "
-                       + (verify or "echo 'no verify yet' && exit 1") + "\n", "tasks: the kit's recipes and verify")
-            verify, sure = "just verify", True
         plan.write(".ub/config", render_config(main, mode, verify, sure, langs), "the project's settings")
         if langs:
             plan.once(".ub/uml/policy.edn", render_policy(repo, langs), "uml-viewer policy (levels: TODO)")
@@ -506,11 +506,11 @@ def install(repo: Path, args) -> None:
     ci = args.ci or (repo / ".github" / "workflows" / "ub-gate.yml").exists()
     plan.write(".claude/settings.json", merged_settings(plan.read(".claude/settings.json"), ask_rules(langs, ci)),
                "ask the owner before edits of the gate, its settings and the skills")
-    j = wire_justfile(plan, verify)
+    j = wire_justfile(plan, args.no_just)
     wire_gitignore(plan, langs)
     wire_agents(plan, render_block(mode, main, j))
     if args.ci:
-        plan.write(".github/workflows/ub-gate.yml", render_ci(repo, main, langs), "the gate in CI")
+        plan.write(".github/workflows/ub-gate.yml", render_ci(repo, main, langs, verify), "the gate in CI")
 
     print(f"ub-kit {VERSION} → {repo}{' (dry run)' if args.dry_run else ''}")
     print("  languages: " + (", ".join(f"{l} ({'/'.join(p for p in (i['rel'], i['src']) if p) or '.'})" for l, i in langs.items())
@@ -528,7 +528,8 @@ def install(repo: Path, args) -> None:
 Next:
   1. Open Claude Code in {repo} and run /ub-setup — it finishes the setup with you
      (verify, module boundaries, the diagram's layers{', the baseline' if mode == 'ratchet' else ''}{', the stack' if not langs else ''}).
-  2. Or by hand: {j}ub-doctor{f'; {j}ub-baseline' if mode == 'ratchet' else ''}; then on a task branch {j}gate and {j}review.
+  2. Or by hand: .ub/ub doctor{'; .ub/ub baseline' if mode == 'ratchet' else ''}; then on a task branch .ub/ub gate and .ub/ub review
+     (Windows: py .ub\\ub gate){f'; with just: {j}gate, {j}review' if j else ''}.
   Commit .ub/, .claude/ and the edited files on a branch; nothing was committed.""")
 
 
@@ -539,6 +540,7 @@ def main() -> None:
     p.add_argument("--mode", choices=["strict", "ratchet"], help="default: ratchet when code exists")
     p.add_argument("--main", help="the main branch (default: detected)")
     p.add_argument("--ci", action="store_true", help="add .github/workflows/ub-gate.yml")
+    p.add_argument("--no-just", action="store_true", help="do not import the kit's recipes into an existing justfile")
     p.add_argument("--upgrade", action="store_true", help="rewrite only the kit's own files")
     p.add_argument("--dry-run", action="store_true", help="show what would change")
     args = p.parse_args()

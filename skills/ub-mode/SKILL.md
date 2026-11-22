@@ -3,7 +3,7 @@ name: ub-mode
 description: >
   Robert C. Martin's reduced principles (unclebob/ub-mode, verbatim) with the ub-kit gate.
   Every change follows First Make it Work, then Make it Right, then Follow Practice, and ends
-  with a green `just gate` and an answered `just review`. Use for every task in this
+  with a green `.ub/ub gate` and an answered `.ub/ub review`. Use for every task in this
   repository, when the user runs /ub-mode, or asks for the reduced principles.
 ---
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """ub — one disciplined agent per task, checked by Robert C. Martin's tools (ub-kit).
 
-Run from the repository; the justfile wraps every command:
+Run from the repository root: .ub/ub COMMAND (Windows: py .ub\\ub COMMAND). A project with a
+justfile may import .ub/ub.just for the same commands through just (just gate, …):
   gate [BASE]               the task's gate for what changed since BASE (default: the merge-base
                             with the main branch): verify, CRAP, DRY, mutation, structure.
                             Exit 0 green, 1 red, 2 cannot run.
@@ -823,7 +824,7 @@ class Gate:
             else:
                 bad.append(f"{ns} {name}: CRAP {crap}" + (f" (baseline {was})" if was else ""))
         if bad:
-            hint = "" if not self.ratchet or BASELINE.exists() else "; ratchet mode has no baseline yet: just ub-baseline"
+            hint = "" if not self.ratchet or BASELINE.exists() else "; ratchet mode has no baseline yet: .ub/ub baseline"
             self.fail(f"CRAP >= {limit:g} or no coverage: {len(bad)} function(s) ({rel(log)}){hint}", bad)
 
     def dry(self, lang: Lang, sources: list) -> None:
@@ -949,7 +950,7 @@ class Gate:
         else:
             violating = DIAGRAM.read_text(encoding="utf-8").count(":violating true")
             if violating:
-                self.fail(f"{violating} dependency edge(s) break the Dependency Rule (just uml)")
+                self.fail(f"{violating} dependency edge(s) break the Dependency Rule (.ub/ub uml)")
 
     def result(self) -> int:
         print()
@@ -982,8 +983,8 @@ def review_prompt(base: str, card: str) -> str:
         parts += ["## Card", card, ""]
     parts += ["## Commits", git("log", "--format=- %h %s", f"{base}..HEAD").rstrip() or "(none yet)", ""]
     summary = OUT / "gate" / "summary.txt"
-    parts += ["## Gate (.ub/out/gate/summary.txt of the last `just gate`: stages, skips, debt, result)",
-              summary.read_text(encoding="utf-8") if summary.exists() else "no gate summary — `just gate` was not run", ""]
+    parts += ["## Gate (.ub/out/gate/summary.txt of the last `.ub/ub gate`: stages, skips, debt, result)",
+              summary.read_text(encoding="utf-8") if summary.exists() else "no gate summary — `.ub/ub gate` was not run", ""]
     diff = git("diff", base, "--", ".", *[f":(exclude){p}" for p in LOCKFILES])
     # Files the task has not committed yet are often most of it; git diff does not show them.
     for f in git("ls-files", "-z", "--others", "--exclude-standard").split("\0"):
@@ -1202,7 +1203,7 @@ def cmd_baseline() -> int:
     BASELINE.parent.mkdir(parents=True, exist_ok=True)
     BASELINE.write_text(
         f"# ub baseline, {time.strftime('%F')} at {head}: CRAP debt the gate tolerates in ratchet mode while it\n"
-        "# does not grow. Regenerate it only deliberately (just ub-baseline), with the owner.\n"
+        "# does not grow. Regenerate it only deliberately (.ub/ub baseline), with the owner.\n"
         + "".join("\t".join(r) + "\n" for r in rows), encoding="utf-8")
     (BASELINE.parent / "summary.txt").write_text(f"{time.strftime('%F')} at {head}\n" + "\n".join(lines) + "\n")
     print("\n".join(lines))
@@ -1222,8 +1223,8 @@ def cmd_doctor() -> int:
     py = python311()
     bad += check(bool(py), f"Python >= 3.11 for Martin's tools: {py}" if py else "no Python >= 3.11 on PATH (brew install python@3.12)")
     bad += check(bool(shutil.which("git")), "git")
-    bad += check(bool(shutil.which("just")) or None, "just" if shutil.which("just") else "just is missing (brew install just) — or run python3 .ub/ub …")
-    check(tools_ready() or None, f"crapper, mutator, dryer in {tools_dir()}" if tools_ready() else "Martin's tools are not installed yet: just ub-tools (the gate does it on first run)")
+    check(True, "just (optional): " + ("installed; .ub/ub.just gives just gate, …" if shutil.which("just") else "not installed — not needed, the commands are .ub/ub …"))
+    check(tools_ready() or None, f"crapper, mutator, dryer in {tools_dir()}" if tools_ready() else "Martin's tools are not installed yet: .ub/ub tools install (the gate does it on first run)")
     print("configuration")
     try:
         cfg = load_config()
@@ -1241,7 +1242,7 @@ def cmd_doctor() -> int:
     main_ok = ref_exists(cfg.main) or ref_exists(f"origin/{cfg.main}")
     bad += check(main_ok or None, f"main branch: {cfg.main}" if main_ok else f"no branch {cfg.main} yet (main = … in .ub/config)")
     if cfg.mode == "ratchet":
-        bad += check(BASELINE.exists(), f"ratchet mode, baseline {rel(BASELINE)}" if BASELINE.exists() else "ratchet mode without a baseline: just ub-baseline")
+        bad += check(BASELINE.exists(), f"ratchet mode, baseline {rel(BASELINE)}" if BASELINE.exists() else "ratchet mode without a baseline: .ub/ub baseline")
     else:
         check(True, "strict mode: everything in a changed file must be clean")
     for lang in cfg.langs:
@@ -1250,7 +1251,7 @@ def cmd_doctor() -> int:
             bad += check(ok, text)
     print("review by another model")
     found = [r for r in dict.fromkeys(cfg.reviewers) if shutil.which(r)]
-    bad += check(bool(found), f"installed: {', '.join(found)} (login and credits are checked only by just review)" if found else "none of " + ", ".join(cfg.reviewers) + " is installed")
+    bad += check(bool(found), f"installed: {', '.join(found)} (login and credits are checked only by .ub/ub review)" if found else "none of " + ", ".join(cfg.reviewers) + " is installed")
     print("structure (uml-viewer)")
     if POLICY.exists():
         levels = re.search(r"^[^;]*:levels\s*\[\s*\[", POLICY.read_text(), re.M) is not None
@@ -1402,7 +1403,7 @@ def main(argv: list) -> int:
             cfg = load_config()
             base = args[0] if args and args[0] else default_base(cfg)
             if not ref_exists(base):
-                print(f"GATE RED: no base commit (the merge-base with {cfg.main}? pass one: just gate <commit>)")
+                print(f"GATE RED: no base commit (the merge-base with {cfg.main}? pass one: .ub/ub gate <commit>)")
                 return 2
             return Gate(cfg, base).run()
         if cmd == "review":

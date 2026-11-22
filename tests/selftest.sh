@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ub-kit's own check: installs the kit into throwaway repositories and asserts what the gate says.
 #   tests/selftest.sh [python] [go] [typescript]     (default: python go; typescript needs npm)
-# Needs git, just, python >= 3.11, uv (python), go (go), node + npm (typescript). Uses the shared
+# Needs git, python >= 3.11, just (the go case: a project that already has a justfile), uv (python), go (go), node + npm (typescript). Uses the shared
 # tool cache (~/.cache/ub-kit). Work dir: $UB_SELFTEST_DIR or a temp dir, removed on success.
 set -uo pipefail
 
@@ -74,8 +74,12 @@ EOF
   printf '.venv/\n__pycache__/\n' >.gitignore
   git init -q -b main && commit "legacy shop" && uv sync -q || { bad "uv sync"; return; }
   expect 0 "install (ratchet)" -- "$kit/install.sh" . --mode ratchet
-  sed -i.bak '/TODO(ub-setup)/d; s#^    .*pytest -q$#    uv run pytest -q#' justfile && rm -f justfile.bak
-  expect 0 "baseline" -- just ub-baseline
+  [[ ! -e justfile ]] && ok "no justfile is created: the commands are .ub/ub" || bad "a justfile was created"
+  has .ub/config "uv run pytest -q" "verify is the guessed chain, in .ub/config"
+  sed -i.bak '/TODO(ub-setup)/d' .ub/config && rm -f .ub/config.bak
+  expect 0 "baseline" -- .ub/ub baseline
+  .ub/ub doctor >"$work/doctor.log" 2>&1
+  has "$work/doctor.log" "just (optional)" "doctor: just is optional"
   has .ub/baseline/crap.tsv "shop.domain.fees	tier" "tier() is old debt in the baseline"
   commit "ub-kit" && git checkout -qb task
 
@@ -87,7 +91,7 @@ def discount(amount: int, loyal: bool) -> int:
         return amount // 10
     return 0
 EOF
-  expect 1 "a new function without tests is red" -- just gate
+  expect 1 "a new function without tests is red" -- .ub/ub gate
   has .ub/out/gate/summary.txt "DEBT: CRAP" "tier() reported as DEBT, not red"
   has .ub/out/gate/summary.txt "mutants in src/shop/domain/fees.py" "new mutants are red"
 
@@ -101,12 +105,12 @@ def test_loyal_customers_get_a_tenth_off_above_500() -> None:
     assert discount(500, loyal=True) == 0
     assert discount(1000, loyal=False) == 0
 EOF
-  expect 0 "tested, the change is green despite old debt" -- just gate
+  expect 0 "tested, the change is green despite old debt" -- .ub/ub gate
   commit "discount" && git checkout -qb weaker
   sed -i.bak '/assert discount(500, loyal=True) == 0/d' tests/test_fees.py && rm -f tests/test_fees.py.bak
-  expect 1 "a weakened test is red" -- just gate task
+  expect 1 "a weakened test is red" -- .ub/ub gate task
   has .ub/out/gate/summary.txt "killed before now survive" "the regression is named"
-  expect 1 "and stays red on a rerun" -- just gate task
+  expect 1 "and stays red on a rerun" -- .ub/ub gate task
 
   say "python: snapshots not committed — a rerun still cannot launder a weakened test"
   git checkout -q task && git checkout -q -- . && git checkout -qb loose
@@ -114,8 +118,8 @@ EOF
   local b
   b=$(git rev-parse HEAD)
   sed -i.bak '/assert discount(500, loyal=True) == 0/d' tests/test_fees.py && rm -f tests/test_fees.py.bak
-  expect 1 "a weakened test is red" -- just gate "$b"
-  expect 1 "and stays red on a rerun" -- just gate "$b"
+  expect 1 "a weakened test is red" -- .ub/ub gate "$b"
+  expect 1 "and stays red on a rerun" -- .ub/ub gate "$b"
 }
 
 go_case() {
@@ -141,10 +145,13 @@ func TestNet(t *testing.T) {
 	}
 }
 EOF
+  printf '# acme tasks\nverify:\n    cd backend && go vet ./... && go test ./...\n' >justfile
   git init -q -b master && commit "acme"
   expect 0 "install (strict)" -- "$kit/install.sh" .
   has .ub/config "root = backend" "the Go root is backend/"
-  sed -i.bak '/TODO(ub-setup)/d' justfile && rm -f justfile.bak
+  has .ub/config "verify = just verify" "the project's own just verify is the verify"
+  has justfile "import '.ub/ub.just'" "the existing justfile gets the kit's recipes"
+  has AGENTS.md "just gate" "the rules name the just form too"
   commit "ub-kit" && git checkout -qb task
   cat >backend/internal/pricing/tax.go <<'EOF'
 package pricing
@@ -230,16 +237,16 @@ EOF
   (cd web && npm install --silent --no-audit --no-fund) || { bad "npm install"; return; }
   git init -q -b main && commit "web"
   expect 0 "install" -- "$kit/install.sh" .
-  sed -i.bak '/TODO(ub-setup)/d' justfile && rm -f justfile.bak
+  sed -i.bak '/TODO(ub-setup)/d' .ub/config && rm -f .ub/config.bak
   commit "ub-kit" && git checkout -qb task
   printf '\nexport function split(total: number, parts: number): number[] {\n  if (parts < 1) throw new Error("parts")\n  const share = Math.floor(total / parts)\n  return Array.from({ length: parts }, (_, i) => (i < total %% parts ? share + 1 : share))\n}\n' >>web/src/money.ts
   printf "it('split', () => expect(split(9, 3)).toEqual([3, 3, 3]))\n" >>web/src/money.spec.ts
   sed -i.bak "s#import { cents } from './money'#import { cents, split } from './money'#" web/src/money.spec.ts && rm -f web/src/money.spec.ts.bak
-  expect 1 "without the overlay plugin the gate is red" -- just gate
+  expect 1 "without the overlay plugin the gate is red" -- .ub/ub gate
   has .ub/out/gate/summary.txt "overlay plugin" "it says why"
   { sed -n '/^import { lstatSync }/,$p' .ub/snippets/vitest-mutator-overlay.ts.txt
     printf "import { fileURLToPath } from 'node:url'\nexport default { plugins: [mutatorOverlay(fileURLToPath(new URL('./', import.meta.url)))] }\n"; } >web/vitest.config.ts
-  expect 1 "with it the weak spec leaves real survivors" -- just gate
+  expect 1 "with it the weak spec leaves real survivors" -- .ub/ub gate
   has .ub/out/gate/summary.txt "survived" "survivors are reported"
 }
 
