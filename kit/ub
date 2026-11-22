@@ -966,9 +966,29 @@ def run_reviewer(name: str, prompt: Path, answer: Path, err: Path, turns: str) -
         tail = [l for l in err.read_text(errors="replace").splitlines() if l.strip()][-1:]
         return f"exit {rc}: {tail[0][:200] if tail else 'no message'}"
     if name != "codex":  # codex wrote its last message itself
-        answer.write_text(final_message(raw.read_text(errors="replace")))
+        text = raw.read_text(errors="replace")
+        stopped = run_error(text)
+        if stopped:
+            tail = [l for l in err.read_text(errors="replace").splitlines() if l.strip()][-1:]
+            return f"stopped ({stopped}){': ' + tail[0][:200] if tail and not tail[0].startswith('---') else ''}"
+        answer.write_text(final_message(text))
     if not VERDICT_RE.match(answer.read_text(errors="replace")):
         return "the final message does not start with a VERDICT line"
+    return ""
+
+
+def run_error(raw: str) -> str:
+    """Why a JSON (claude) or JSON-lines (grok) run ended in error, or "" when it did not —
+    e.g. grok cancels the whole run when a tool needs an approval nobody can give."""
+    for line in reversed(raw.strip().splitlines()):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and ("result" in record or record.get("type") == "result"):
+            if record.get("is_error"):
+                return ", ".join(map(str, record.get("errors") or [record.get("subtype", "error")]))
+            return ""
     return ""
 
 
@@ -1024,9 +1044,11 @@ def ask_reviewers(cfg: Config, text: str, d: Path, label: str) -> int:
 AUDITS = UB / "audits"
 AUDIT_HEAD = """# Audit pass by another model (ub-kit): {concern}
 
-You are auditing one concern of a system that AI agents wrote. You are read-only: do not edit,
-create or delete files; run only commands that change nothing (tests, the project's own read-only
-tools). Never open or quote `.env*`, database dumps, `.ub/out/`, or real people's data.
+You are auditing one concern of a system that AI agents wrote. You are read-only: read files,
+search them, list directories — do not run commands (this run cannot approve them, and one
+that asks for approval stops the audit) and do not edit anything. The tests, their configs,
+`.metrics/` (CRAP and mutation snapshots) and the gate summary below are your evidence. Never
+open or quote `.env*`, database dumps, `.ub/out/`, or real people's data.
 
 Robert C. Martin's way (8 Nov 2026): one pass per concern, judged by interrogating the system
 and reviewing its verification procedures — the tests, the checks, the tools that prove the
