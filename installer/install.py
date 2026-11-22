@@ -247,6 +247,8 @@ structure = auto
 # mutator's workers per file, and how many files are mutated at once (one coverage run first).
 workers = 4
 mutation_jobs = 2
+# A wrapper for mutator runs, e.g. a machine-wide queue of heavy runs (./infra/heavy/run.sh).
+mutation_wrap =
 # Review by another model, in order; when one fails the next answers. grok, codex, claude
 # (claude only when the author is not Claude).
 reviewers = grok codex
@@ -329,7 +331,8 @@ skills: read both before the first change). A large task the owner wants delegat
   Mode {mode}: {modes[mode]}
 - every finding of `{j}review` (another model, read-only) is answered; exit 2 means nobody
   reviewed it — say so, do not merge;
-- the owner has tried the behaviour, and `docs/log/<task>.md` starts with «Не зроблено».
+- the owner has tried the behaviour, and the task's log (`docs/log/<task>.md`, or where the
+  project's rules keep logs) starts with «Не зроблено».
 
 `.ub/`, `.metrics/` and the skills are guarded: never edit them to get past the gate; ask.
 Ask when a requirement is ambiguous. Commit in small steps; push only on the owner's word.
@@ -418,7 +421,7 @@ def wire_justfile(plan: Plan, verify: str) -> str:
         plan.write(jf.name, text.rstrip("\n") + f"\n\n# ub-kit (its recipes clash with {', '.join(clash)}: just ub gate, …)\nmod ub '.ub/ub.just'\n",
                    f"`mod ub`: the project already has {', '.join(clash)}")
         return "just ub "
-    plan.write(jf.name, text.rstrip("\n") + "\n\n# ub-kit: gate, review, uml, ub-baseline, ub-doctor, ub-tools\nimport '.ub/ub.just'\n",
+    plan.write(jf.name, text.rstrip("\n") + "\n\n# ub-kit: gate, review, audit, soak, uml, ub-baseline, ub-doctor, ub-tools\nimport '.ub/ub.just'\n",
                "import the kit's recipes")
     return "just "
 

@@ -135,6 +135,7 @@ class Config:
     langs: list
     acceptance: str = ""
     jobs: int = 2
+    wrap: list = field(default_factory=list)
 
 
 def load_config() -> Config:
@@ -166,6 +167,7 @@ def load_config() -> Config:
         langs=langs,
         acceptance=ub.get("acceptance", "").strip(),
         jobs=max(1, int(ub.get("mutation_jobs", "2") or 2)),
+        wrap=[str(ROOT / w) if w.startswith("./") else w for w in shlex.split(ub.get("mutation_wrap", ""))],
     )
 
 
@@ -449,6 +451,11 @@ class Adapter:
     def root(self) -> Path:
         return self.lang.root
 
+    def mutator(self) -> list:
+        """mutator, behind the project's wrapper for heavy runs if `[ub] mutation_wrap` names one
+        (a machine-wide slot queue when several agents share one machine)."""
+        return [*self.cfg.wrap, tool("mutator")]
+
     def workers(self) -> list:
         return ["--max-workers", self.cfg.workers] if self.cfg.workers else []
 
@@ -505,7 +512,7 @@ class PythonAdapter(Adapter):
     def mutate(self, file, flags, log, reuse=False):
         test = self.lang.opts.get("test", "").strip()
         cov = ["--use-existing-coverage"] if reuse else self._cov()
-        return run([tool("mutator"), "--root", ".", *self.workers(), *cov,
+        return run([*self.mutator(), "--root", ".", *self.workers(), *cov,
                     *(["--test-command", test] if test else []), *flags, file], self.root, log)
 
     def cover_all(self, files, log):
@@ -574,7 +581,7 @@ class GoAdapter(Adapter):
         cover = shlex.join([sys.executable, str(UB / "ub"), "go-cover", str(self.root), pkg])
         cov = ["--use-existing-coverage"] if reuse else ["--coverage-command", cover]
         test = self.lang.opts.get("test", "").strip() or f"go test -count=1 {pkg}"
-        return run([tool("mutator"), "--root", ".", *self.workers(), *cov,
+        return run([*self.mutator(), "--root", ".", *self.workers(), *cov,
                     "--test-command", test, *flags, file], self.root, log)
 
     def cover_all(self, files, log):
@@ -626,7 +633,7 @@ class TsAdapter(Adapter):
         cov = ["--use-existing-coverage"] if reuse else ["--coverage-command", cover]
         test = "MUTATOR_OVERLAY=1 " + shlex.join(ts_vitest(self.root) + ["run", "--bail=1",
                                                                             *(specs or ["--passWithNoTests"])])
-        return run([tool("mutator"), "--root", ".", *self.workers(), *cov,
+        return run([*self.mutator(), "--root", ".", *self.workers(), *cov,
                     "--test-command", test, *flags, file], self.root, log)
 
     def cover_all(self, files, log):
@@ -748,7 +755,7 @@ class Gate:
                 if rc:
                     self.fail(f"acceptance tests failed: {cfg.acceptance} (.ub/out/gate/acceptance.log)")
         else:
-            self.note("NOTE", "no acceptance tests ([ub] acceptance): the owner checks the behaviour by hand")
+            self.note("NOTE", "no [ub] acceptance command: acceptance tests run inside verify, if the project has them, or the owner checks the behaviour by hand")
         for lang in cfg.langs:
             self.language(lang)
         self.structure()

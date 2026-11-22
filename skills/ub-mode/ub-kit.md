@@ -13,7 +13,8 @@ ub-mode, ask the owner. The block ub-kit manages in AGENTS.md / CLAUDE.md names 
 * Every finding of `just review` (another model, read-only) is answered: fixed, or why it is
   wrong. Exit 2 means nobody reviewed it — say so, do not merge. Two rounds of disagreement:
   ask the owner.
-* The owner has tried the behaviour. The log is `docs/log/<task>.md` and the report starts
+* The owner has tried the behaviour. The log is `docs/log/<task>.md` (or where the project's
+  rules keep logs) and the report starts
   with «Не зроблено»: what is not done, skipped or stubbed, which `GATE_SKIP` and why. An empty
   list must be earned.
 
